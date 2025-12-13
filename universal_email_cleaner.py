@@ -507,7 +507,7 @@ class UniversalEmailCleanerApp:
         txt.config(state='disabled')
 
     def show_about(self):
-        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.3.2\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
+        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.3.3\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
 
     # --- Config Management ---
     def load_config(self):
@@ -606,39 +606,46 @@ class UniversalEmailCleanerApp:
         
         # Graph Common Settings (Environment & Mode)
         graph_common_frame = ttk.Frame(self.graph_frame)
-        graph_common_frame.pack(anchor="w", padx=10, pady=5)
+        graph_common_frame.pack(fill="x", padx=10, pady=5)
         
         # Environment Selection
-        ttk.Label(graph_common_frame, text="环境:").pack(side="left")
-        ttk.Radiobutton(graph_common_frame, text="全球版 (Global)", variable=self.graph_env_var, value="Global").pack(side="left", padx=10)
-        ttk.Radiobutton(graph_common_frame, text="世纪互联 (China)", variable=self.graph_env_var, value="China").pack(side="left", padx=10)
+        env_frame = ttk.Frame(graph_common_frame)
+        env_frame.pack(side="left")
+        ttk.Label(env_frame, text="环境:").pack(side="left")
+        ttk.Radiobutton(env_frame, text="全球版 (Global)", variable=self.graph_env_var, value="Global").pack(side="left", padx=5)
+        ttk.Radiobutton(env_frame, text="世纪互联 (China)", variable=self.graph_env_var, value="China").pack(side="left", padx=5)
         
-        ttk.Label(graph_common_frame, text="|  配置方式:").pack(side="left", padx=10)
-        ttk.Radiobutton(graph_common_frame, text="自动配置 (证书认证)", variable=self.graph_auth_mode_var, value="Auto", command=self.toggle_graph_ui).pack(side="left", padx=10)
-        ttk.Radiobutton(graph_common_frame, text="手动配置 (Client Secret)", variable=self.graph_auth_mode_var, value="Manual", command=self.toggle_graph_ui).pack(side="left", padx=10)
+        ttk.Separator(graph_common_frame, orient="vertical").pack(side="left", fill="y", padx=10)
+        
+        # Mode Selection
+        mode_frame = ttk.Frame(graph_common_frame)
+        mode_frame.pack(side="left")
+        ttk.Label(mode_frame, text="配置方式:").pack(side="left")
+        ttk.Radiobutton(mode_frame, text="自动配置 (证书)", variable=self.graph_auth_mode_var, value="Auto", command=self.toggle_graph_ui).pack(side="left", padx=5)
+        ttk.Radiobutton(mode_frame, text="手动配置 (Secret)", variable=self.graph_auth_mode_var, value="Manual", command=self.toggle_graph_ui).pack(side="left", padx=5)
 
         # Graph Auto Frame
         self.graph_auto_frame = ttk.Frame(self.graph_frame)
-        self.graph_auto_frame.pack(fill="x", padx=10, pady=5)
+        # Note: We don't pack it here, toggle_graph_ui will handle it
         
         ttk.Button(self.graph_auto_frame, text="一键初始化 (创建 App & 证书)", command=self.start_graph_setup_thread).pack(side="left", padx=0)
         ttk.Button(self.graph_auto_frame, text="删除 App", command=self.start_delete_app_thread).pack(side="left", padx=5)
 
         # Graph Manual Frame
         self.graph_manual_frame = ttk.Frame(self.graph_frame)
-        self.graph_manual_frame.pack(fill="x", padx=10, pady=5)
+        # Note: We don't pack it here, toggle_graph_ui will handle it
         
         manual_grid = ttk.Frame(self.graph_manual_frame)
-        manual_grid.pack(anchor="w")
+        manual_grid.pack(anchor="w", fill="x", expand=True)
         
-        ttk.Label(manual_grid, text="Tenant ID:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(manual_grid, textvariable=self.tenant_id_var, width=40).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(manual_grid, text="Tenant ID:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(manual_grid, textvariable=self.tenant_id_var, width=50).grid(row=0, column=1, padx=5, pady=5)
         
-        ttk.Label(manual_grid, text="App ID:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(manual_grid, textvariable=self.app_id_var, width=40).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Label(manual_grid, text="App ID:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(manual_grid, textvariable=self.app_id_var, width=50).grid(row=1, column=1, padx=5, pady=5)
         
-        ttk.Label(manual_grid, text="Client Secret:").grid(row=2, column=0, sticky="w", padx=5, pady=2)
-        ttk.Entry(manual_grid, textvariable=self.client_secret_var, width=40, show="*").grid(row=2, column=1, padx=5, pady=2)
+        ttk.Label(manual_grid, text="Client Secret:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(manual_grid, textvariable=self.client_secret_var, width=50, show="*").grid(row=2, column=1, padx=5, pady=5)
 
         # Initial Toggle
         self.toggle_connection_ui()
@@ -659,8 +666,8 @@ class UniversalEmailCleanerApp:
             
         mode = self.graph_auth_mode_var.get()
         if mode == "Auto":
-            self.graph_auto_frame.pack(fill="x", padx=10, pady=5)
             self.graph_manual_frame.pack_forget()
+            self.graph_auto_frame.pack(fill="x", padx=10, pady=5)
         else:
             self.graph_auto_frame.pack_forget()
             self.graph_manual_frame.pack(fill="x", padx=10, pady=5)
