@@ -507,7 +507,7 @@ class UniversalEmailCleanerApp:
         txt.config(state='disabled')
 
     def show_about(self):
-        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.3.3\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
+        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.3.4\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
 
     # --- Config Management ---
     def load_config(self):
@@ -638,14 +638,16 @@ class UniversalEmailCleanerApp:
         manual_grid = ttk.Frame(self.graph_manual_frame)
         manual_grid.pack(anchor="w", fill="x", expand=True)
         
-        ttk.Label(manual_grid, text="Tenant ID:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(manual_grid, textvariable=self.tenant_id_var, width=50).grid(row=0, column=1, padx=5, pady=5)
+        grid_opts = {'padx': 5, 'pady': 5, 'sticky': 'w'}
         
-        ttk.Label(manual_grid, text="App ID:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(manual_grid, textvariable=self.app_id_var, width=50).grid(row=1, column=1, padx=5, pady=5)
+        ttk.Label(manual_grid, text="租户 ID (Tenant ID):").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(manual_grid, textvariable=self.tenant_id_var, width=50).grid(row=0, column=1, **grid_opts)
         
-        ttk.Label(manual_grid, text="Client Secret:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(manual_grid, textvariable=self.client_secret_var, width=50, show="*").grid(row=2, column=1, padx=5, pady=5)
+        ttk.Label(manual_grid, text="客户端 ID (App ID):").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(manual_grid, textvariable=self.app_id_var, width=50).grid(row=1, column=1, **grid_opts)
+        
+        ttk.Label(manual_grid, text="客户端密钥 (Client Secret):").grid(row=2, column=0, **grid_opts)
+        ttk.Entry(manual_grid, textvariable=self.client_secret_var, width=50, show="*").grid(row=2, column=1, **grid_opts)
 
         # Initial Toggle
         self.toggle_connection_ui()

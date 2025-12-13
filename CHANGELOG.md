@@ -1,3 +1,8 @@
+## v1.3.4 (2025-12-13)
+- **UI 优化**：
+  - 统一了 Graph API 手动配置界面的样式，使其与 LargeAttachmentFinder 保持一致（使用 Grid 布局，标签更清晰）。
+  - 确保“环境选择”（Global/China）在手动配置模式下依然可见且生效。
+
 ## v1.3.3 (2025-12-13)
 - **UI 优化**：
   - 重新调整 Graph API 配置界面布局，确保在手动配置模式下，App ID、Tenant ID 和 Client Secret 输入框正确显示。
