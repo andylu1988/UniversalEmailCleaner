@@ -1,0 +1,5 @@
+@@
+-                                extra_fields = ('calendar_item_type', 'uid', 'recurring_master_id', 'recurrence', 'is_recurring')
+-                                qs = account.calendar.view(start=view_start, end=view_end).only(*extra_fields)
++                                # CalendarView 下不要用 only()（会触发 folders 字段解析错误）
++                                qs = account.calendar.view(start=view_start, end=view_end)

@@ -1,0 +1,56 @@
+=== UniversalEmailCleaner v1.2.23 - 关键诊断改进说明 ===
+
+【新增功能】
+
+1️⃣  增强 Advanced 日志诊断
+   - 现在打印 4 个关键参数来识别项的真实类型：
+     • ItemClass: 服务端项类（应为 IPM.Appointment 标准日历项）
+     • PyType: Python 运行时类型名
+     • ClassName: 对象类名
+     • Type: EWS calendar_item_type (Single/Occurrence/RecurringMaster/Exception/Unknown)
+   
+   - 样本输出:
+     [EWS] ItemClass=IPM.Appointment PyType=CalendarItem ClassName=CalendarItem Type=Single ...
+     [EWS] ItemClass=IPM.Schedule.Meeting.Request PyType=Message ClassName=Message Type=Unknown ...
+   
+   ➜ 若看到 ItemClass 不是 IPM.Appointment，说明该项不是标准日历项，calendar_item_type 为空是正常的
+
+2️⃣  类型检测推断逻辑
+   - 若 calendar_item_type 为空，使用以下推断规则（优先级递降）：
+     ✓ 有 recurrence ⇒ RecurringMaster
+     ✓ 有 recurring_master_id ⇒ Occurrence  
+     ✓ is_recurring == False ⇒ Single
+     ✓ 其他 ⇒ Unknown
+   
+   - 这保证即便 EWS 映射失败，也能通过其他字段正确分类
+
+3️⃣  RecurringMasterId 兼容性提升
+   - 处理 recurring_master_id 为 ItemId 对象的情况
+   - 自动提取 .id 和 .changekey，安全调用 account.calendar.get()
+
+4️⃣  改进响应日志
+   - TraceAdapter 现在完整捕获 GetItem 响应 XML（截断至 50KB）
+   - 可验证服务端返回的 <t:CalendarItemType> 实际值
+
+【使用建议】
+
+🔍 运行时启用 Advanced 日志：
+   1. 打开应用，选择 Advanced 日志级别
+   2. 执行报告
+   3. 检查日志输出中的 [EWS] ItemClass 和 Type 信息
+   
+   若 Type 仍为 Unknown，检查：
+   • ItemClass 是否为 IPM.Appointment（若不是，该项不是标准日历项）
+   • recurring_master_id 是否有值（Occurrence/Exception 需要）
+   • recurrence 是否有值（RecurringMaster 需要）
+
+📋 调试步骤：
+   1. 查看 Advanced 日志中的 ItemClass、PyType、Type
+   2. 若 ItemClass ≠ IPM.Appointment，问题源于非标准项
+   3. 若 Type=Unknown 但有 recurring_master_id，检查主项查询是否成功
+   4. 分享 app.log 以供诊断
+
+【文件路径】
+   EXE: Q:\Dev\Python\TestEnv1\Projects\Python\UniversalEmailCleaner\dist\UniversalEmailCleaner_v1.2.23.exe
+   代码: Q:\Dev\Python\TestEnv1\Projects\Python\UniversalEmailCleaner\universal_email_cleaner.py
+   日志: 文档\UniversalEmailCleaner\app.log
