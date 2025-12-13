@@ -61,3 +61,4 @@ A powerful, user-friendly GUI tool designed to help administrators and users cle
 ## License
 
 MIT License
+# UniversalEmailCleaner
