@@ -18,7 +18,7 @@ import webbrowser
 import base64
 import io
 
-APP_VERSION = "v1.5.6"
+APP_VERSION = "v1.5.7"
 GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
 GITHUB_PROFILE_URL = "https://github.com/andylu1988"
 
@@ -545,6 +545,47 @@ def decode_graph_goid_base64_to_hex(goid_b64):
         return raw.hex().upper()
     except Exception:
         return ""
+
+
+def redact_sensitive_headers(headers):
+    """Mask sensitive auth material before writing debug logs."""
+    if not isinstance(headers, dict) or not headers:
+        return {}
+
+    redacted = {}
+    for k, v in headers.items():
+        key_lower = (k or "").lower()
+        if key_lower == "authorization":
+            if isinstance(v, str) and v.lower().startswith("bearer "):
+                redacted[k] = "Bearer ***"
+            else:
+                redacted[k] = "***"
+        else:
+            redacted[k] = v
+    return redacted
+
+
+def format_graph_meeting_response_status(user_email, user_role, organizer_email, attendees, item_response_status):
+    """Organizer => attendee responses; Attendee => self responseStatus."""
+    role = (user_role or "").strip().lower()
+    user_email_l = (user_email or "").strip().lower()
+    organizer_email_l = (organizer_email or "").strip().lower()
+
+    if role == "organizer":
+        parts = []
+        for a in (attendees or []):
+            addr = ((a.get("emailAddress") or {}).get("address") or "").strip()
+            if not addr:
+                continue
+            addr_l = addr.lower()
+            if addr_l in (user_email_l, organizer_email_l):
+                continue
+            resp = ((a.get("status") or {}).get("response") or "").strip()
+            parts.append(f"{addr}:{resp}" if resp else f"{addr}:")
+        return ";".join(parts)
+
+    # attendee (or unknown): Graph event.responseStatus is the current user's status
+    return ((item_response_status or {}).get("response") or "").strip()
 
 
 class Logger:
@@ -1763,7 +1804,7 @@ class UniversalEmailCleanerApp:
                 graph_log_level = self.log_level_var.get()
                 if graph_log_level in ("Advanced", "Expert"):
                     self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
-                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(req_headers, default=str)}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers), default=str)}")
                     if params:
                         self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
 
@@ -1821,8 +1862,6 @@ class UniversalEmailCleanerApp:
                                 addr = (a.get('emailAddress') or {}).get('address')
                                 if addr:
                                     attendee_emails.append(addr)
-
-                            response_status = (item.get('responseStatus') or {}).get('response', '')
                             is_cancelled = bool(item.get('isCancelled'))
                             ical_uid = item.get('iCalUId', '')
                             series_master_id = item.get('seriesMasterId', '')
@@ -1844,6 +1883,14 @@ class UniversalEmailCleanerApp:
                                     user_role = 'Organizer'
                             except Exception:
                                 pass
+
+                            response_status = format_graph_meeting_response_status(
+                                user_email=user,
+                                user_role=user_role,
+                                organizer_email=sender,
+                                attendees=attendees,
+                                item_response_status=(item.get('responseStatus') or {}),
+                            )
 
                             # Align with EWS: MeetingGOID uses iCalUId (same semantic as item.uid in EWS)
                             meeting_goid = ical_uid or ''
@@ -1947,7 +1994,7 @@ class UniversalEmailCleanerApp:
                             
                             if graph_log_level in ("Advanced", "Expert"):
                                 self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
-                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(req_headers, default=str)}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers), default=str)}")
 
                             self.log(f"请求: DELETE {del_url}", is_advanced=True)
                             del_resp = requests.delete(del_url, headers=req_headers)

@@ -1,3 +1,9 @@
+## v1.5.7 (2025-12-14)
+- **Graph 日志脱敏**：Advanced/Expert 的 Graph REST 日志中，`Authorization` 会自动打码（`Bearer ***`），避免 Token 泄漏。
+- **ResponseStatus 逻辑修正**：
+  - `UserRole=Organizer` 时，`ResponseStatus` 输出参会者（Attendees）的响应状态；
+  - `UserRole=Attendee` 时，`ResponseStatus` 输出当前用户自己的响应状态。
+
 ## v1.5.6 (2025-12-14)
 - **高级/专家日志分开记录**：新增按日滚动的 `app_advanced_YYYY-MM-DD.log` 与 `app_expert_YYYY-MM-DD.log`，用于分别记录高级与专家排错信息。
 - **Graph REST 排错日志增强**：Advanced/Expert 级别都会记录 Graph 请求/响应详情（Advanced 记录摘要并截断 body；Expert 记录更完整内容并截断至 50KB）。
