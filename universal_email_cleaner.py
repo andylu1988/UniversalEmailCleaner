@@ -11,6 +11,23 @@ import subprocess
 from datetime import datetime, timedelta
 import logging
 import traceback
+import ctypes
+from concurrent.futures import ThreadPoolExecutor
+
+# DPI Awareness
+try:
+    # Try to set Per-Monitor DPI Awareness V2 (Windows 10 Creators Update and newer)
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except Exception:
+    try:
+        # Fallback to Per-Monitor DPI Aware (Windows 8.1 and newer)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            # Fallback to System DPI Aware (Windows Vista and newer)
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # Try importing dependencies
 try:
@@ -238,6 +255,7 @@ class Logger:
         self.log_area = log_area
         self.log_file_path = log_file_path
         self.level = "NORMAL" # NORMAL or ADVANCED
+        self.file_lock = threading.Lock()
 
     def set_level(self, level):
         self.level = level
@@ -252,18 +270,20 @@ class Logger:
         
         # GUI Update (Thread safe)
         def _update():
-            self.log_area.config(state='normal')
-            self.log_area.insert(tk.END, full_msg + "\n")
-            self.log_area.see(tk.END)
-            self.log_area.config(state='disabled')
+            if self.log_area:
+                self.log_area.config(state='normal')
+                self.log_area.insert(tk.END, full_msg + "\n")
+                self.log_area.see(tk.END)
+                self.log_area.config(state='disabled')
         
         if self.log_area:
             self.log_area.after(0, _update)
         
         # File Write
         try:
-            with open(self.log_file_path, "a", encoding="utf-8") as f:
-                f.write(full_msg + "\n")
+            with self.file_lock:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(full_msg + "\n")
         except:
             pass
 
@@ -272,8 +292,9 @@ class Logger:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] [DEBUG_DATA] {message}"
         try:
-            with open(self.log_file_path, "a", encoding="utf-8") as f:
-                f.write(full_msg + "\n")
+            with self.file_lock:
+                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                    f.write(full_msg + "\n")
         except:
             pass
 
@@ -354,9 +375,16 @@ class UniversalEmailCleanerApp:
         self.root = root
         self.root.title("通用邮件清理工具 (Graph API & EWS)")
         self.root.geometry("1100x900")
+        self.root.minsize(900, 700)
+        
+        # Auto-scale font based on DPI if possible, or just use a slightly larger default
+        default_font_size = 10
         
         style = ttk.Style()
         style.theme_use('clam')
+        style.configure('.', font=('Segoe UI', default_font_size))
+        style.configure('Treeview', font=('Segoe UI', default_font_size))
+        style.configure('TButton', font=('Segoe UI', default_font_size))
         
         # --- Paths & Config ---
         self.documents_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
@@ -455,7 +483,7 @@ class UniversalEmailCleanerApp:
         log_frame = ttk.LabelFrame(main_frame, text="运行日志")
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
         
-        self.log_area = scrolledtext.ScrolledText(log_frame, height=12, state='disabled', font=("Consolas", 9))
+        self.log_area = scrolledtext.ScrolledText(log_frame, height=12, state='disabled', font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
         
         self.logger = Logger(self.log_area, self.log_file_path)
@@ -507,7 +535,7 @@ class UniversalEmailCleanerApp:
         txt.config(state='disabled')
 
     def show_about(self):
-        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.3.4\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
+        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.4.0\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
 
     # --- Config Management ---
     def load_config(self):
@@ -1162,6 +1190,124 @@ class UniversalEmailCleanerApp:
                             
         return self.run_powershell_script(script)
 
+    def process_single_user_graph(self, user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock):
+        self.log(f"--- 正在处理: {user} ---")
+        try:
+            url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
+            
+            if target_type == "Email":
+                params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
+            else:
+                params = {"$top": 100, "$select": "id,subject,organizer,start,type,isCancelled,body"}
+
+            if filter_str: params["$filter"] = filter_str
+            
+            if body_keyword:
+                params["$search"] = f'"body:{body_keyword}"'
+                headers["ConsistencyLevel"] = "eventual"
+            
+            while url:
+                if self.log_level_var.get() == "Advanced":
+                    self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
+                    if params: self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
+
+                self.log(f"请求: GET {url} | 参数: {params}", is_advanced=True)
+                resp = requests.get(url, headers=headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
+                
+                if self.log_level_var.get() == "Advanced":
+                    self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(dict(resp.headers), default=str)}")
+                    self.logger.log_to_file_only(f"BODY: {resp.text}")
+                
+                if resp.status_code != 200:
+                    self.log(f"  X 查询失败: {resp.text}", "ERROR")
+                    self.log(f"响应: {resp.text}", is_advanced=True)
+                    with csv_lock:
+                        writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
+                    break
+                
+                data = resp.json()
+                items = data.get('value', [])
+                
+                if not items:
+                    self.log("  未找到匹配项。")
+                    break
+
+                for item in items:
+                    should_delete = True
+                    if body_keyword and "$search" not in params:
+                        content = item.get('body', {}).get('content', '')
+                        if body_keyword.lower() not in content.lower():
+                            should_delete = False
+
+                    if should_delete:
+                        item_id = item['id']
+                        subject = item.get('subject', '无主题')
+                        
+                        if target_type == "Email":
+                            sender = item.get('from', {}).get('emailAddress', {}).get('address', '未知')
+                            time_val = item.get('receivedDateTime')
+                            item_type = "Email"
+                        else:
+                            sender = item.get('organizer', {}).get('emailAddress', {}).get('address', '未知')
+                            time_val = item.get('start', {}).get('dateTime')
+                            item_type = item.get('type', 'Event')
+                            if item.get('isCancelled'): item_type += " (Cancelled)"
+
+                        row_data = {
+                            'UserPrincipalName': user,
+                            'ItemId': item_id,
+                            'Subject': subject,
+                            'Sender/Organizer': sender,
+                            'Time': time_val,
+                            'Type': item_type,
+                            'Action': 'ReportOnly' if report_only else 'Delete',
+                            'Status': 'Pending',
+                            'Details': ''
+                        }
+
+                        if report_only:
+                            self.log(f"  [报告] 发现: {subject} ({item_type})")
+                            row_data['Status'] = 'Skipped'
+                            row_data['Details'] = '仅报告模式'
+                        else:
+                            self.log(f"  正在删除: {subject}")
+                            del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
+                            
+                            if self.log_level_var.get() == "Advanced":
+                                self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
+
+                            self.log(f"请求: DELETE {del_url}", is_advanced=True)
+                            del_resp = requests.delete(del_url, headers=headers)
+                            
+                            if self.log_level_var.get() == "Advanced":
+                                self.logger.log_to_file_only(f"GRAPH RESP: {del_resp.status_code}")
+                                self.logger.log_to_file_only(f"BODY: {del_resp.text}")
+                            
+                            if del_resp.status_code == 204:
+                                self.log("    √ 已删除")
+                                row_data['Status'] = 'Success'
+                            else:
+                                self.log(f"    X 删除失败: {del_resp.status_code}", "ERROR")
+                                self.log(f"响应: {del_resp.text}", is_advanced=True)
+                                row_data['Status'] = 'Failed'
+                                row_data['Details'] = f"状态码: {del_resp.status_code}"
+                        
+                        with csv_lock:
+                            writer.writerow(row_data)
+                            # csvfile.flush() # Flush handled by main loop or context manager
+
+                url = data.get('@odata.nextLink')
+                # Reset params for next link as they are usually included
+                params = None 
+                
+        except Exception as ue:
+            self.log(f"  X 处理用户出错: {ue}", "ERROR")
+            with csv_lock:
+                writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': str(ue)})
+
     # --- Graph Logic ---
     def run_graph_cleanup(self):
         try:
@@ -1246,124 +1392,23 @@ class UniversalEmailCleanerApp:
                 filter_str = " and ".join(filters)
                 body_keyword = self.criteria_body.get()
 
-                for user in users:
-                    self.log(f"--- 正在处理: {user} ---")
-                    try:
-                        url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
-                        
-                        if target_type == "Email":
-                            params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
-                        else:
-                            params = {"$top": 100, "$select": "id,subject,organizer,start,type,isCancelled,body"}
-
-                        if filter_str: params["$filter"] = filter_str
-                        
-                        if body_keyword:
-                            params["$search"] = f'"body:{body_keyword}"'
-                            headers["ConsistencyLevel"] = "eventual"
-                        
-                        while url:
-                            if self.log_level_var.get() == "Advanced":
-                                self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
-                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
-                                if params: self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
-
-                            self.log(f"请求: GET {url} | 参数: {params}", is_advanced=True)
-                            resp = requests.get(url, headers=headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
-                            
-                            if self.log_level_var.get() == "Advanced":
-                                self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
-                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(dict(resp.headers), default=str)}")
-                                self.logger.log_to_file_only(f"BODY: {resp.text}")
-                            
-                            if resp.status_code != 200:
-                                self.log(f"  X 查询失败: {resp.text}", "ERROR")
-                                self.log(f"响应: {resp.text}", is_advanced=True)
-                                writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
-                                break
-                            
-                            data = resp.json()
-                            items = data.get('value', [])
-                            
-                            if not items:
-                                self.log("  未找到匹配项。")
-                                break
-
-                            for item in items:
-                                should_delete = True
-                                if body_keyword and "$search" not in params:
-                                    content = item.get('body', {}).get('content', '')
-                                    if body_keyword.lower() not in content.lower():
-                                        should_delete = False
-
-                                if should_delete:
-                                    item_id = item['id']
-                                    subject = item.get('subject', '无主题')
-                                    
-                                    if target_type == "Email":
-                                        sender = item.get('from', {}).get('emailAddress', {}).get('address', '未知')
-                                        time_val = item.get('receivedDateTime')
-                                        item_type = "Email"
-                                    else:
-                                        sender = item.get('organizer', {}).get('emailAddress', {}).get('address', '未知')
-                                        time_val = item.get('start', {}).get('dateTime')
-                                        item_type = item.get('type', 'Event')
-                                        if item.get('isCancelled'): item_type += " (Cancelled)"
-
-                                    row_data = {
-                                        'UserPrincipalName': user,
-                                        'ItemId': item_id,
-                                        'Subject': subject,
-                                        'Sender/Organizer': sender,
-                                        'Time': time_val,
-                                        'Type': item_type,
-                                        'Action': 'ReportOnly' if report_only else 'Delete',
-                                        'Status': 'Pending',
-                                        'Details': ''
-                                    }
-
-                                    if report_only:
-                                        self.log(f"  [报告] 发现: {subject} ({item_type})")
-                                        row_data['Status'] = 'Skipped'
-                                        row_data['Details'] = '仅报告模式'
-                                    else:
-                                        self.log(f"  正在删除: {subject}")
-                                        del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
-                                        
-                                        if self.log_level_var.get() == "Advanced":
-                                            self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
-                                            self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
-
-                                        self.log(f"请求: DELETE {del_url}", is_advanced=True)
-                                        del_resp = requests.delete(del_url, headers=headers)
-                                        
-                                        if self.log_level_var.get() == "Advanced":
-                                            self.logger.log_to_file_only(f"GRAPH RESP: {del_resp.status_code}")
-                                            self.logger.log_to_file_only(f"BODY: {del_resp.text}")
-                                        
-                                        if del_resp.status_code == 204:
-                                            self.log("    √ 已删除")
-                                            row_data['Status'] = 'Success'
-                                        else:
-                                            self.log(f"    X 删除失败: {del_resp.status_code}", "ERROR")
-                                            self.log(f"响应: {del_resp.text}", is_advanced=True)
-                                            row_data['Status'] = 'Failed'
-                                            row_data['Details'] = f"状态码: {del_resp.status_code}"
-                                    
-                                    writer.writerow(row_data)
-                                    csvfile.flush()
-
-                            url = data.get('@odata.nextLink')
-                            # Reset params for next link as they are usually included
-                            params = None 
-                            
-                    except Exception as ue:
-                        self.log(f"  X 处理用户出错: {ue}", "ERROR")
-                        writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': str(ue)})
-                            
-                    except Exception as ue:
-                        self.log(f"  X 处理用户出错: {ue}", "ERROR")
-                        writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': str(ue)})
+                csv_lock = threading.Lock()
+                report_only = self.report_only_var.get()
+                
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = []
+                    for user in users:
+                        futures.append(executor.submit(
+                            self.process_single_user_graph, 
+                            user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock
+                        ))
+                    
+                    # Wait for all to complete
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.log(f"Task Error: {e}", "ERROR")
 
             self.log(f">>> 任务完成! 报告: {report_path}")
             msg_title = "完成"
@@ -1379,6 +1424,322 @@ class UniversalEmailCleanerApp:
             messagebox.showerror("错误", str(e))
         finally:
             pass
+
+    def process_single_user_ews(self, target_email, creds, config, auth_type, use_auto, target_type, 
+                                start_date_str, end_date_str, criteria_sender, criteria_msg_id, 
+                                criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope, 
+                                report_only, writer, csv_lock, log_level):
+        try:
+            self.log(f"--- 正在处理: {target_email} ---")
+            
+            # Impersonation Setup
+            if auth_type == "Impersonation":
+                if use_auto:
+                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=IMPERSONATION)
+                else:
+                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=IMPERSONATION)
+            else:
+                # Delegate / Direct
+                if use_auto:
+                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=DELEGATE)
+                else:
+                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=DELEGATE)
+
+            self.log(f"已连接到邮箱: {target_email}", is_advanced=True)
+
+            # Date Parsing
+            start_dt = None
+            end_dt = None
+            
+            if start_date_str:
+                dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+                start_dt = EWSDateTime.from_datetime(dt).replace(tzinfo=account.default_timezone)
+                
+            if end_date_str:
+                dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)
+                end_dt = EWSDateTime.from_datetime(dt).replace(tzinfo=account.default_timezone)
+
+            # Recurrence Cache
+            recurrence_cache = {}
+
+            if target_type == "Email":
+                qs = account.inbox.all()
+                if start_dt:
+                    qs = qs.filter(datetime_received__gte=start_dt)
+                if end_dt:
+                    qs = qs.filter(datetime_received__lt=end_dt)
+                if criteria_sender:
+                    qs = qs.filter(sender__icontains=criteria_sender)
+            else:
+                # Meeting Logic with CalendarView
+                if start_dt or end_dt:
+                    # View requires both start and end. Default if missing.
+                    view_start = start_dt if start_dt else EWSDateTime(1900, 1, 1, tzinfo=account.default_timezone)
+                    view_end = end_dt if end_dt else EWSDateTime(2100, 1, 1, tzinfo=account.default_timezone)
+                    
+                    self.log(f"使用日历视图 (CalendarView) 展开循环会议: {view_start} -> {view_end}", is_advanced=True)
+                    qs = account.calendar.view(start=view_start, end=view_end)
+                else:
+                    self.log("未指定日期范围，使用普通查询 (不展开循环会议实例)", is_advanced=True)
+                    qs = account.calendar.all()
+
+                if criteria_sender:
+                    qs = qs.filter(organizer__icontains=criteria_sender)
+                
+                if meeting_only_cancelled:
+                    qs = qs.filter(is_cancelled=True)
+
+            # Common Filters
+            is_calendar_view = (target_type == "Meeting" and (start_dt or end_dt))
+
+            if not is_calendar_view:
+                if criteria_msg_id:
+                    qs = qs.filter(message_id=criteria_msg_id)
+                if criteria_subject:
+                    qs = qs.filter(subject__icontains=criteria_subject)
+            
+            self.log(f"正在查询 EWS...", is_advanced=True)
+            
+            items = list(qs) # Execute query
+            if not items:
+                self.log(f"用户 {target_email} 未找到项目。")
+            
+            for item in items:
+                # Client Side Filters
+                if target_type == "Meeting":
+                    # 1. Filter by Subject (if CalendarView)
+                    if is_calendar_view and criteria_subject:
+                        if criteria_subject.lower() not in (item.subject or "").lower():
+                            continue
+                    
+                    # 2. Filter by Organizer (if CalendarView)
+                    if is_calendar_view and criteria_sender:
+                        organizer_email = item.organizer.email_address if item.organizer else ""
+                        if criteria_sender.lower() not in organizer_email.lower():
+                            continue
+
+                    # 3. Filter by IsCancelled (if CalendarView)
+                    if is_calendar_view and meeting_only_cancelled:
+                        if not item.is_cancelled:
+                            continue
+
+                    inferred_type = guess_calendar_item_type(item)
+
+                    # Apply scope filter using inferred type
+                    if "Single" in meeting_scope:
+                        if inferred_type != 'Single': continue
+                    elif "Series" in meeting_scope:
+                        if inferred_type not in ('RecurringMaster', 'Occurrence', 'Exception'): continue
+
+                # Body check
+                if criteria_body:
+                    if criteria_body.lower() not in (item.body or "").lower():
+                        continue
+
+                # Enrich meeting item details
+                if target_type == "Meeting":
+                    try:
+                        _id = getattr(item, 'id', None) or getattr(item, 'item_id', None)
+                        _ck = getattr(item, 'changekey', None) or getattr(item, 'change_key', None) or getattr(item, 'changeKey', None)
+                        if _id:
+                            full_item = account.calendar.get(id=_id, changekey=_ck) if _ck else account.calendar.get(id=_id)
+                            try:
+                                full_item.refresh()
+                            except Exception:
+                                pass
+                            if full_item:
+                                item = full_item
+                    except Exception as _e:
+                        self.log(f"  无法获取完整项属性 (GetItem): {_e}", is_advanced=True)
+
+                # Extract attributes
+                item_id = getattr(item, 'id', None) or (item.item_id if hasattr(item, 'item_id') else getattr(item, 'message_id', 'Unknown ID'))
+                subject = item.subject
+                
+                row = {}
+                if target_type == "Meeting":
+                    # (1) Master vs Instance
+                    has_recurrence = getattr(item, 'recurrence', None) is not None
+                    has_instance_markers = (getattr(item, 'original_start', None) is not None) or (getattr(item, 'recurrence_id', None) is not None)
+                    
+                    if has_recurrence:
+                        m_type = "RecurringMaster"
+                    elif has_instance_markers:
+                        m_type = "Instance"
+                    else:
+                        m_type = guess_calendar_item_type(item)
+
+                    m_uid = getattr(item, 'uid', '')
+                    m_recurring_master_id = getattr(item, 'recurring_master_id', None)
+                    m_goid = m_uid
+                    m_clean_goid = m_goid 
+                    m_organizer = item.organizer.email_address if item.organizer else 'Unknown'
+                    
+                    m_attendees = []
+                    if item.required_attendees:
+                        m_attendees.extend([a.mailbox.email_address for a in item.required_attendees if a.mailbox])
+                    if item.optional_attendees:
+                        m_attendees.extend([a.mailbox.email_address for a in item.optional_attendees if a.mailbox])
+                    m_attendees_str = "; ".join(m_attendees)
+                    
+                    m_start = getattr(item, 'start', '')
+                    m_end = getattr(item, 'end', '')
+                    
+                    m_role = 'Attendee'
+                    if m_organizer.lower() == target_email.lower():
+                        m_role = 'Organizer'
+                    
+                    m_is_cancelled = getattr(item, 'is_cancelled', False)
+                    m_response_status = getattr(item, 'my_response_type', 'Unknown')
+                    
+                    # (2) If instance, determine Occurrence vs Exception
+                    original_start = getattr(item, 'original_start', None)
+                    if m_type == "Instance":
+                        start_val = getattr(item, 'start', None)
+                        if start_val and original_start and start_val != original_start:
+                            m_type = "Exception"
+                        else:
+                            master_item = None
+                            try:
+                                master_id = m_recurring_master_id
+                                master_ck = None
+                                if master_id is not None:
+                                    if hasattr(master_id, "id"):
+                                        master_ck = getattr(master_id, "changekey", None)
+                                        master_id = master_id.id
+                                    master_item = account.calendar.get(id=master_id, changekey=master_ck) if master_ck else account.calendar.get(id=master_id)
+                                if master_item is None and m_uid:
+                                    for m in account.calendar.all():
+                                        if getattr(m, 'uid', '') == m_uid and getattr(m, 'recurrence', None):
+                                            master_item = m
+                                            break
+                            except Exception:
+                                pass
+
+                            if master_item:
+                                try:
+                                    subj_diff = (item.subject or '') != (master_item.subject or '')
+                                    loc_diff = (getattr(item, 'location', None) or '') != (getattr(master_item, 'location', None) or '')
+                                    def attendees_set(it):
+                                        s = set()
+                                        if getattr(it, 'required_attendees', None):
+                                            s.update([a.mailbox.email_address for a in it.required_attendees if a.mailbox])
+                                        if getattr(it, 'optional_attendees', None):
+                                            s.update([a.mailbox.email_address for a in it.optional_attendees if a.mailbox])
+                                        return s
+                                    att_diff = attendees_set(item) != attendees_set(master_item)
+                                    if subj_diff or loc_diff or att_diff:
+                                        m_type = "Exception"
+                                    else:
+                                        m_type = "Occurrence"
+                                except Exception:
+                                    m_type = "Instance-Unknown"
+                            else:
+                                m_type = "Instance-Unknown"
+
+                    # (3) Recurrence Pattern
+                    m_recurrence = ""
+                    m_pattern_details = ""
+                    m_recurrence_duration = ""
+                    m_is_endless = "N/A"
+                    
+                    if m_type == "RecurringMaster" and getattr(item, 'recurrence', None):
+                        pat = getattr(item.recurrence, 'pattern', None)
+                        if pat:
+                            m_recurrence = translate_pattern_type(pat.__class__.__name__)
+                            m_pattern_details = get_pattern_details(pat)
+                        m_recurrence_duration = get_recurrence_duration(item.recurrence)
+                        m_is_endless = is_endless_recurring(m_type, item.recurrence)
+                    elif m_type in ("Occurrence", "Exception", "Instance", "Instance-Unknown"):
+                        master_item_for_pattern = None
+                        try:
+                            if m_uid and m_uid in recurrence_cache:
+                                m_recurrence = recurrence_cache[m_uid]
+                            else:
+                                master_id = m_recurring_master_id
+                                master_ck = None
+                                if master_id is not None:
+                                    if hasattr(master_id, "id"):
+                                        master_ck = getattr(master_id, "changekey", None)
+                                        master_id = master_id.id
+                                    try:
+                                        master_item_for_pattern = account.calendar.get(id=master_id, changekey=master_ck) if master_ck else account.calendar.get(id=master_id)
+                                    except Exception:
+                                        pass
+                                
+                                if master_item_for_pattern is None and m_uid:
+                                    try:
+                                        for m in account.calendar.all():
+                                            if getattr(m, 'uid', '') == m_uid and getattr(m, 'recurrence', None):
+                                                master_item_for_pattern = m
+                                                break
+                                    except Exception:
+                                        pass
+                                
+                                if master_item_for_pattern and getattr(master_item_for_pattern, 'recurrence', None):
+                                    pat = getattr(master_item_for_pattern.recurrence, 'pattern', None)
+                                    if pat:
+                                        m_recurrence = translate_pattern_type(pat.__class__.__name__)
+                                        m_pattern_details = get_pattern_details(pat)
+                                        if m_uid:
+                                            recurrence_cache[m_uid] = m_recurrence
+                                    m_recurrence_duration = get_recurrence_duration(master_item_for_pattern.recurrence)
+                        except Exception:
+                            pass
+
+                    row = {
+                        'UserPrincipalName': target_email,
+                        'Subject': subject,
+                        'Type': m_type,
+                        'MeetingGOID': m_goid,
+                        'CleanGOID': m_clean_goid,
+                        'Organizer': m_organizer,
+                        'Attendees': m_attendees_str,
+                        'Start': m_start,
+                        'End': m_end,
+                        'UserRole': m_role,
+                        'IsCancelled': m_is_cancelled,
+                        'ResponseStatus': m_response_status,
+                        'RecurrencePattern': m_recurrence,
+                        'PatternDetails': m_pattern_details,
+                        'RecurrenceDuration': m_recurrence_duration,
+                        'IsEndless': m_is_endless,
+                        'Action': 'Report' if report_only else 'Delete',
+                        'Status': 'Pending',
+                        'Details': ''
+                    }
+                else:
+                    # Email Fields
+                    sender_val = item.sender.email_address if item.sender else 'Unknown'
+                    received_val = getattr(item, 'datetime_received', 'Unknown')
+                    row = {
+                        'UserPrincipalName': target_email,
+                        'MessageId': item_id,
+                        'Subject': subject,
+                        'Sender': sender_val,
+                        'Received': received_val,
+                        'Action': 'Report' if report_only else 'Delete',
+                        'Status': 'Pending',
+                        'Details': ''
+                    }
+
+                if report_only:
+                    self.log(f"  [报告] 发现: {item.subject}")
+                    row['Status'] = 'Skipped'
+                else:
+                    self.log(f"  正在删除: {item.subject}")
+                    item.delete()
+                    row['Status'] = 'Success'
+                
+                with csv_lock:
+                    writer.writerow(row)
+                    # csvfile.flush()
+
+        except Exception as e:
+            self.log(f"  处理用户 {target_email} 出错: {e}", "ERROR")
+            self.log(f"  Traceback: {traceback.format_exc()}", is_advanced=True)
+            with csv_lock:
+                writer.writerow({'UserPrincipalName': target_email, 'Status': 'Error', 'Details': str(e)})
 
     # --- EWS Logic ---
     def run_ews_cleanup(self):
@@ -1477,406 +1838,41 @@ class UniversalEmailCleanerApp:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
 
-                for target_email in users:
-                    self.log(f"--- 正在处理: {target_email} ---")
-                    try:
-                        # Impersonation Setup
-                        if auth_type == "Impersonation":
-                            if use_auto:
-                                account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=IMPERSONATION)
-                            else:
-                                account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=IMPERSONATION)
-                        else:
-                            # Delegate / Direct
-                            if use_auto:
-                                account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=DELEGATE)
-                            else:
-                                account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=DELEGATE)
+                # Extract variables for threads
+                start_date_str = self._normalize_date_input(self.criteria_start_date.get())
+                end_date_str = self._normalize_date_input(self.criteria_end_date.get())
+                
+                # Update UI vars once if needed
+                if start_date_str: self.criteria_start_date.set(start_date_str)
+                if end_date_str: self.criteria_end_date.set(end_date_str)
 
-                        self.log(f"已连接到邮箱: {target_email}", is_advanced=True)
+                criteria_sender = self.criteria_sender.get()
+                criteria_msg_id = self.criteria_msg_id.get()
+                criteria_subject = self.criteria_subject.get()
+                criteria_body = self.criteria_body.get()
+                meeting_only_cancelled = self.meeting_only_cancelled_var.get()
+                meeting_scope = self.meeting_scope_var.get()
+                report_only = self.report_only_var.get()
+                log_level = self.log_level_var.get()
+                
+                csv_lock = threading.Lock()
 
-                        # Build Query
-                        
-                        # Date Parsing (Pre-calculation)
-                        start_date_str = self._normalize_date_input(self.criteria_start_date.get())
-                        end_date_str = self._normalize_date_input(self.criteria_end_date.get())
-                        
-                        start_dt = None
-                        end_dt = None
-                        
-                        if start_date_str:
-                            self.criteria_start_date.set(start_date_str)
-                            dt = datetime.strptime(start_date_str, "%Y-%m-%d")
-                            start_dt = EWSDateTime.from_datetime(dt).replace(tzinfo=account.default_timezone)
-                            
-                        if end_date_str:
-                            self.criteria_end_date.set(end_date_str)
-                            dt = datetime.strptime(end_date_str, "%Y-%m-%d") + timedelta(days=1)
-                            end_dt = EWSDateTime.from_datetime(dt).replace(tzinfo=account.default_timezone)
-
-                        # Recurrence Cache
-                        recurrence_cache = {}
-                        # Track UIDs we need to fetch masters for
-                        uids_to_fetch = set()
-
-                        if target_type == "Email":
-                            qs = account.inbox.all()
-                            if start_dt:
-                                qs = qs.filter(datetime_received__gte=start_dt)
-                            if end_dt:
-                                qs = qs.filter(datetime_received__lt=end_dt)
-                            if self.criteria_sender.get():
-                                qs = qs.filter(sender__icontains=self.criteria_sender.get())
-                        else:
-                            # Meeting Logic with CalendarView
-                            if start_dt or end_dt:
-                                # View requires both start and end. Default if missing.
-                                # Default range: 1900 to 2100 if not specified
-                                view_start = start_dt if start_dt else EWSDateTime(1900, 1, 1, tzinfo=account.default_timezone)
-                                view_end = end_dt if end_dt else EWSDateTime(2100, 1, 1, tzinfo=account.default_timezone)
-                                
-                                self.log(f"使用日历视图 (CalendarView) 展开循环会议: {view_start} -> {view_end}", is_advanced=True)
-                                # Some fields cause InvalidField errors in CalendarView.only().
-                                # Use plain view() and enrich per-item via GetItem.
-                                qs = account.calendar.view(start=view_start, end=view_end)
-                               
-                            else:
-                                self.log("未指定日期范围，使用普通查询 (不展开循环会议实例)", is_advanced=True)
-                                qs = account.calendar.all()
-
-                            if self.criteria_sender.get():
-                                qs = qs.filter(organizer__icontains=self.criteria_sender.get())
-                            
-                            # Meeting Specifics
-                            if self.meeting_only_cancelled_var.get():
-                                qs = qs.filter(is_cancelled=True)
-
-                        # Common Filters
-                        # Note: CalendarView does not support server-side filtering (Restrictions).
-                        # If using CalendarView (Meeting with date range), we must apply filters client-side.
-                        is_calendar_view = (target_type == "Meeting" and (start_dt or end_dt))
-
-                        if not is_calendar_view:
-                            if self.criteria_msg_id.get():
-                                qs = qs.filter(message_id=self.criteria_msg_id.get())
-                            if self.criteria_subject.get():
-                                qs = qs.filter(subject__icontains=self.criteria_subject.get())
-                        
-                        # Body (Client-side filter for EWS usually, or use full text search if supported)
-                        # EWS 'body__icontains' can be slow or restricted.
-                        
-                        self.log(f"正在查询 EWS...", is_advanced=True)
-                        
-                        # Note: Avoid using only() here because some field paths are
-                        # not available in CalendarView / folder contexts and raise errors.
-                        # We'll access fields safely via getattr when present.
-                        if target_type == "Meeting":
-                            pass
-
-                        items = list(qs) # Execute query
-                        if not items:
-                            self.log("未找到项目。")
-                        
-                        for item in items:
-                            # Client Side Filters
-                            if target_type == "Meeting":
-                                # 1. Filter by Subject (if CalendarView)
-                                if is_calendar_view and self.criteria_subject.get():
-                                    if self.criteria_subject.get().lower() not in (item.subject or "").lower():
-                                        continue
-                                
-                                # 2. Filter by Organizer (if CalendarView)
-                                if is_calendar_view and self.criteria_sender.get():
-                                    organizer_email = item.organizer.email_address if item.organizer else ""
-                                    if self.criteria_sender.get().lower() not in organizer_email.lower():
-                                        continue
-
-                                # 3. Filter by IsCancelled (if CalendarView)
-                                if is_calendar_view and self.meeting_only_cancelled_var.get():
-                                    if not item.is_cancelled:
-                                        continue
-
-                                scope = self.meeting_scope_var.get()
-                                inferred_type = guess_calendar_item_type(item)
-
-                                # Apply scope filter using inferred type
-                                if "Single" in scope:
-                                    if inferred_type != 'Single': continue
-                                elif "Series" in scope:
-                                    if inferred_type not in ('RecurringMaster', 'Occurrence', 'Exception'): continue
-                                # If "All", pass all items
-
-                            # Body check if needed
-                            if self.criteria_body.get():
-                                if self.criteria_body.get().lower() not in (item.body or "").lower():
-                                    continue
-
-                            # Enrich meeting item details (GetItem) to ensure key fields are populated
-                            if target_type == "Meeting":
-                                try:
-                                    # CalendarView() often returns shallow items. Re-fetch the full item to ensure key fields exist.
-                                    _id = getattr(item, 'id', None) or getattr(item, 'item_id', None)
-                                    _ck = getattr(item, 'changekey', None) or getattr(item, 'change_key', None) or getattr(item, 'changeKey', None)
-                                    if _id:
-                                        # Fetch full item by id/changekey, then refresh to load full properties
-                                        full_item = account.calendar.get(id=_id, changekey=_ck) if _ck else account.calendar.get(id=_id)
-                                        try:
-                                            full_item.refresh()  # Trigger GetItem to load additional fields
-                                        except Exception:
-                                            pass
-
-                                        if full_item:
-                                            item = full_item
-                                        # Advanced debug: dump key fields including guess result and raw fields
-                                        if self.log_level_var.get() == "Advanced":
-                                            guess_type = guess_calendar_item_type(item)
-                                            ci_type = getattr(item, 'calendar_item_type', None)
-                                            ci_uid = getattr(item, 'uid', None)
-                                            ci_master = getattr(item, 'recurring_master_id', None)
-                                            is_rec = getattr(item, 'is_recurring', None)
-                                            rec = getattr(item, 'recurrence', None)
-                                            rec_id = getattr(item, 'recurrence_id', None)
-                                            orig_start = getattr(item, 'original_start', None)
-                                            py_type = type(item)
-                                            class_name = item.__class__.__name__
-                                            item_class = getattr(item, 'item_class', None)
-                                            self.log(
-                                                f"[EWS] ItemFields -> "
-                                                f"GuessType={guess_type} "
-                                                f"RawType={ci_type} "
-                                                f"UID={ci_uid} "
-                                                f"IsRecurring={is_rec} "
-                                                f"RecMasterId={ci_master} "
-                                                f"RecurrenceId={rec_id} "
-                                                f"OriginalStart={orig_start} "
-                                                f"HasRecurrence={rec is not None} "
-                                                f"PyType={py_type} "
-                                                f"ClassName={class_name} "
-                                                f"ItemClass={item_class}",
-                                                is_advanced=True
-                                            )
-                                except Exception as _e:
-                                    # Continue with shallow item if enrichment fails
-                                    self.log(f"  无法获取完整项属性 (GetItem): {_e}", is_advanced=True)
-
-                            # Extract attributes safely (CalendarItem vs Message)
-                            item_id = getattr(item, 'id', None) or (item.item_id if hasattr(item, 'item_id') else getattr(item, 'message_id', 'Unknown ID'))
-                            subject = item.subject
-                            
-                            row = {}
-                            if target_type == "Meeting":
-                                # (1) Master vs Instance
-                                has_recurrence = getattr(item, 'recurrence', None) is not None
-                                has_instance_markers = (getattr(item, 'original_start', None) is not None) or (getattr(item, 'recurrence_id', None) is not None)
-                                
-                                if has_recurrence:
-                                    m_type = "RecurringMaster"
-                                elif has_instance_markers:
-                                    m_type = "Instance"
-                                else:
-                                    # Fall back to guess if neither markers are present
-                                    m_type = guess_calendar_item_type(item)
-
-                                # Get UID and RecurringMasterId
-                                m_uid = getattr(item, 'uid', '')
-                                m_recurring_master_id = getattr(item, 'recurring_master_id', None)
-                                
-                                # GOID / CleanGOID
-                                m_goid = m_uid
-                                m_clean_goid = m_goid 
-
-                                # Organizer
-                                m_organizer = item.organizer.email_address if item.organizer else 'Unknown'
-                                
-                                # Attendees
-                                m_attendees = []
-                                if item.required_attendees:
-                                    m_attendees.extend([a.mailbox.email_address for a in item.required_attendees if a.mailbox])
-                                if item.optional_attendees:
-                                    m_attendees.extend([a.mailbox.email_address for a in item.optional_attendees if a.mailbox])
-                                m_attendees_str = "; ".join(m_attendees)
-                                
-                                # Start / End
-                                m_start = getattr(item, 'start', '')
-                                m_end = getattr(item, 'end', '')
-                                
-                                # User Role
-                                # Check if target_email is organizer
-                                m_role = 'Attendee'
-                                if m_organizer.lower() == target_email.lower():
-                                    m_role = 'Organizer'
-                                
-                                # IsCancelled
-                                m_is_cancelled = getattr(item, 'is_cancelled', False)
-                                
-                                # Response Status
-                                m_response_status = getattr(item, 'my_response_type', 'Unknown')
-                                
-                                # (2) If instance, determine Occurrence vs Exception
-                                original_start = getattr(item, 'original_start', None)
-                                if m_type == "Instance":
-                                    # Definite exception when start != original_start
-                                    start_val = getattr(item, 'start', None)
-                                    if start_val and original_start and start_val != original_start:
-                                        m_type = "Exception"
-                                    else:
-                                        # Try to fetch master and compare subject/location/attendees
-                                        master_item = None
-                                        try:
-                                            # Prefer recurring_master_id
-                                            master_id = m_recurring_master_id
-                                            master_ck = None
-                                            if master_id is not None:
-                                                if hasattr(master_id, "id"):
-                                                    master_ck = getattr(master_id, "changekey", None)
-                                                    master_id = master_id.id
-                                                master_item = account.calendar.get(id=master_id, changekey=master_ck) if master_ck else account.calendar.get(id=master_id)
-                                            # Fallback by UID
-                                            if master_item is None and m_uid:
-                                                for m in account.calendar.all():
-                                                    if getattr(m, 'uid', '') == m_uid and getattr(m, 'recurrence', None):
-                                                        master_item = m
-                                                        break
-                                        except Exception as e:
-                                            self.log(f"  查找主项用于比较失败: {e}", is_advanced=True)
-
-                                        if master_item:
-                                            try:
-                                                subj_diff = (item.subject or '') != (master_item.subject or '')
-                                                loc_diff = (getattr(item, 'location', None) or '') != (getattr(master_item, 'location', None) or '')
-                                                # Compare attendees (basic string set compare)
-                                                def attendees_set(it):
-                                                    s = set()
-                                                    if getattr(it, 'required_attendees', None):
-                                                        s.update([a.mailbox.email_address for a in it.required_attendees if a.mailbox])
-                                                    if getattr(it, 'optional_attendees', None):
-                                                        s.update([a.mailbox.email_address for a in it.optional_attendees if a.mailbox])
-                                                    return s
-                                                att_diff = attendees_set(item) != attendees_set(master_item)
-                                                if subj_diff or loc_diff or att_diff:
-                                                    m_type = "Exception"
-                                                else:
-                                                    m_type = "Occurrence"
-                                            except Exception:
-                                                m_type = "Instance-Unknown"
-                                        else:
-                                            m_type = "Instance-Unknown"
-
-                                # (3) Recurrence Pattern
-                                m_recurrence = ""
-                                m_pattern_details = ""
-                                m_recurrence_duration = ""
-                                m_is_endless = "N/A"
-                                
-                                if m_type == "RecurringMaster" and getattr(item, 'recurrence', None):
-                                    pat = getattr(item.recurrence, 'pattern', None)
-                                    if pat:
-                                        m_recurrence = translate_pattern_type(pat.__class__.__name__)
-                                        m_pattern_details = get_pattern_details(pat)
-                                    m_recurrence_duration = get_recurrence_duration(item.recurrence)
-                                    m_is_endless = is_endless_recurring(m_type, item.recurrence)
-                                elif m_type in ("Occurrence", "Exception", "Instance", "Instance-Unknown"):
-                                    # Instance: try find master via RecurringMasterId, then UID; cache it
-                                    master_item_for_pattern = None
-                                    try:
-                                        # Check cache first
-                                        if m_uid and m_uid in recurrence_cache:
-                                            m_recurrence = recurrence_cache[m_uid]
-                                            if self.log_level_var.get() == "Advanced":
-                                                self.log(f"  使用缓存的 Pattern: {m_recurrence}", is_advanced=True)
-                                        else:
-                                            master_id = m_recurring_master_id
-                                            master_ck = None
-                                            if master_id is not None:
-                                                if hasattr(master_id, "id"):
-                                                    master_ck = getattr(master_id, "changekey", None)
-                                                    master_id = master_id.id
-                                                try:
-                                                    master_item_for_pattern = account.calendar.get(id=master_id, changekey=master_ck) if master_ck else account.calendar.get(id=master_id)
-                                                    if self.log_level_var.get() == "Advanced":
-                                                        self.log(f"  通过 RecurringMasterId 获得主项", is_advanced=True)
-                                                except Exception as e:
-                                                    if self.log_level_var.get() == "Advanced":
-                                                        self.log(f"  通过 RecurringMasterId 查找失败: {e}", is_advanced=True)
-                                            
-                                            if master_item_for_pattern is None and m_uid:
-                                                try:
-                                                    if self.log_level_var.get() == "Advanced":
-                                                        self.log(f"  尝试通过 UID 查找主项...", is_advanced=True)
-                                                    for m in account.calendar.all():
-                                                        if getattr(m, 'uid', '') == m_uid and getattr(m, 'recurrence', None):
-                                                            master_item_for_pattern = m
-                                                            if self.log_level_var.get() == "Advanced":
-                                                                self.log(f"  通过 UID 找到主项", is_advanced=True)
-                                                            break
-                                                except Exception as e:
-                                                    if self.log_level_var.get() == "Advanced":
-                                                        self.log(f"  通过 UID 查找主项失败: {e}", is_advanced=True)
-                                            
-                                            if master_item_for_pattern and getattr(master_item_for_pattern, 'recurrence', None):
-                                                pat = getattr(master_item_for_pattern.recurrence, 'pattern', None)
-                                                if pat:
-                                                    m_recurrence = translate_pattern_type(pat.__class__.__name__)
-                                                    m_pattern_details = get_pattern_details(pat)
-                                                    if m_uid:
-                                                        recurrence_cache[m_uid] = m_recurrence
-                                                    if self.log_level_var.get() == "Advanced":
-                                                        self.log(f"  获得 Pattern: {m_recurrence}", is_advanced=True)
-                                                m_recurrence_duration = get_recurrence_duration(master_item_for_pattern.recurrence)
-                                    except Exception as e:
-                                        self.log(f"  获取主项用于计算 Pattern 失败: {e}", is_advanced=True)
-
-                                row = {
-                                    'UserPrincipalName': target_email,
-                                    'Subject': subject,
-                                    'Type': m_type,
-                                    'MeetingGOID': m_goid,
-                                    'CleanGOID': m_clean_goid,
-                                    'Organizer': m_organizer,
-                                    'Attendees': m_attendees_str,
-                                    'Start': m_start,
-                                    'End': m_end,
-                                    'UserRole': m_role,
-                                    'IsCancelled': m_is_cancelled,
-                                    'ResponseStatus': m_response_status,
-                                    'RecurrencePattern': m_recurrence,
-                                    'PatternDetails': m_pattern_details,
-                                    'RecurrenceDuration': m_recurrence_duration,
-                                    'IsEndless': m_is_endless,
-                                    'Action': 'Report' if self.report_only_var.get() else 'Delete',
-                                    'Status': 'Pending',
-                                    'Details': ''
-                                }
-                            else:
-                                # Email Fields
-                                sender_val = item.sender.email_address if item.sender else 'Unknown'
-                                received_val = getattr(item, 'datetime_received', 'Unknown')
-                                row = {
-                                    'UserPrincipalName': target_email,
-                                    'MessageId': item_id,
-                                    'Subject': subject,
-                                    'Sender': sender_val,
-                                    'Received': received_val,
-                                    'Action': 'Report' if self.report_only_var.get() else 'Delete',
-                                    'Status': 'Pending',
-                                    'Details': ''
-                                }
-
-                            if self.report_only_var.get():
-                                self.log(f"  [报告] 发现: {item.subject}")
-                                row['Status'] = 'Skipped'
-                            else:
-                                self.log(f"  正在删除: {item.subject}")
-                                item.delete()
-                                row['Status'] = 'Success'
-                            
-                            writer.writerow(row)
-                            csvfile.flush()
-
-                    except Exception as e:
-                        self.log(f"  处理用户 {target_email} 出错: {e}", "ERROR")
-                        self.log(f"  Traceback: {traceback.format_exc()}", is_advanced=True)
-                        writer.writerow({'UserPrincipalName': target_email, 'Status': 'Error', 'Details': str(e)})
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = []
+                    for target_email in users:
+                        futures.append(executor.submit(
+                            self.process_single_user_ews,
+                            target_email, creds, config, auth_type, use_auto, target_type,
+                            start_date_str, end_date_str, criteria_sender, criteria_msg_id,
+                            criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope,
+                            report_only, writer, csv_lock, log_level
+                        ))
+                    
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            self.log(f"Task Error: {e}", "ERROR")
 
             self.log(f">>> 任务完成。报告: {report_path}")
             
