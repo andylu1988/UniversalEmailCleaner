@@ -1,3 +1,9 @@
+## v1.5.4 (2025-12-14)
+- **Graph 会议循环展开**：Meeting 模式使用 `calendarView`（强制要求开始/结束日期），可在时间范围内扫描循环会议的 occurrence/exception。
+- **Graph 报告对齐 EWS**：Graph Meeting 报告字段对齐 EWS 报告格式，包含 Organizer/Attendees/Start/End/IsCancelled/ResponseStatus 等，并补充 `iCalUId`、`SeriesMasterId`。
+- **GOID 最佳努力**：Graph 尝试通过 MAPI 扩展属性读取 GlobalObjectId（若租户/权限/数据不可用则自动留空，仍可使用 `iCalUId` 追踪）。
+- **UI 提示增强**：会议模式下提示 Graph 必须填写日期范围；EWS 不填写日期范围则不展开循环实例。
+
 ## v1.5.3 (2025-12-14)
 - **UI 更新**：
   - **标题与版本一致性**：标题栏、关于窗口统一显示 v1.5.3。

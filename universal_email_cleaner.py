@@ -18,7 +18,7 @@ import webbrowser
 import base64
 import io
 
-APP_VERSION = "v1.5.3"
+APP_VERSION = "v1.5.4"
 GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
 GITHUB_PROFILE_URL = "https://github.com/andylu1988"
 
@@ -1330,9 +1330,15 @@ class UniversalEmailCleanerApp:
         self.end_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_end_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_start_date)
         self.end_date_entry.grid(row=2, column=3, **grid_opts)
 
+        self.meeting_date_hint_label = ttk.Label(
+            self.filter_frame,
+            text="提示：Graph 会议必须填写开始/结束日期（用于展开循环会议 occurrence/exception）；EWS 不填写日期则不展开循环会议实例。"
+        )
+        self.meeting_date_hint_label.grid(row=3, column=0, columnspan=4, padx=5, pady=(2, 0), sticky='w')
+
         self.lbl_body = ttk.Label(self.filter_frame, text="正文包含:")
-        self.lbl_body.grid(row=3, column=0, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80).grid(row=3, column=1, columnspan=3, **grid_opts)
+        self.lbl_body.grid(row=4, column=0, **grid_opts)
+        ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80).grid(row=4, column=1, columnspan=3, **grid_opts)
 
         self.update_ui_for_target() # Init state
 
@@ -1376,11 +1382,15 @@ class UniversalEmailCleanerApp:
             self.lbl_subject.config(text="会议标题包含:")
             self.lbl_sender.config(text="组织者地址:")
             self.lbl_body.config(text="会议内容包含:")
+            if hasattr(self, 'meeting_date_hint_label'):
+                self.meeting_date_hint_label.grid()
         else:
             self.meeting_opt_frame.pack_forget()
             self.lbl_subject.config(text="邮件主题包含:")
             self.lbl_sender.config(text="发件人地址:")
             self.lbl_body.config(text="邮件正文包含:")
+            if hasattr(self, 'meeting_date_hint_label'):
+                self.meeting_date_hint_label.grid_remove()
 
     def start_cleanup_thread(self):
         if not self.csv_path_var.get():
@@ -1416,6 +1426,13 @@ class UniversalEmailCleanerApp:
         if self.cleanup_target_var.get() == "Meeting":
             start_str = self._normalize_date_input(self.criteria_start_date.get())
             end_str = self._normalize_date_input(self.criteria_end_date.get())
+
+            # Graph calendarView requires both start and end
+            if self.source_type_var.get() == "Graph":
+                if not start_str or not end_str:
+                    messagebox.showwarning("配置缺失", "Graph 模式下会议查询需要【开始日期】和【结束日期】（用于展开循环会议 occurrence/exception）。")
+                    return
+
             if start_str and end_str:
                 try:
                     s_dt = datetime.strptime(start_str, "%Y-%m-%d")
@@ -1423,7 +1440,7 @@ class UniversalEmailCleanerApp:
                     if (e_dt - s_dt).days > 730: # Approx 2 years
                         messagebox.showwarning("日期范围过大", "会议清理的时间跨度不能超过 2 年。")
                         return
-                except:
+                except Exception:
                     pass
 
         # Double Confirmation for Deletion
@@ -1561,15 +1578,29 @@ class UniversalEmailCleanerApp:
                             
         return self.run_powershell_script(script)
 
-    def process_single_user_graph(self, user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock):
+    def process_single_user_graph(self, user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
+                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None):
         self.log(f"--- 正在处理: {user} ---")
         try:
-            url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
-            
-            if target_type == "Email":
-                params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
+            # Meetings: prefer calendarView to expand recurrence into occurrence/exception within a date range
+            if target_type == "Meeting" and resource == "calendarView":
+                if not calendar_view_start or not calendar_view_end:
+                    raise Exception("Graph calendarView requires startDateTime and endDateTime")
+                url = f"{graph_endpoint}/v1.0/users/{user}/calendarView"
+                params = {
+                    "startDateTime": calendar_view_start,
+                    "endDateTime": calendar_view_end,
+                    "$top": 100,
+                    "$select": "id,subject,organizer,attendees,start,end,type,isCancelled,iCalUId,seriesMasterId,bodyPreview",
+                    # Try to read GOID via MAPI extended property PidLidGlobalObjectId (PSETID_Meeting, Id 0x0003)
+                    "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
+                }
             else:
-                params = {"$top": 100, "$select": "id,subject,organizer,start,type,isCancelled,body"}
+                url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
+                if target_type == "Email":
+                    params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
+                else:
+                    params = {"$top": 100, "$select": "id,subject,organizer,attendees,start,end,type,isCancelled,iCalUId,seriesMasterId,bodyPreview"}
 
             if filter_str: params["$filter"] = filter_str
             
@@ -1622,21 +1653,99 @@ class UniversalEmailCleanerApp:
                             item_type = "Email"
                         else:
                             sender = item.get('organizer', {}).get('emailAddress', {}).get('address', '未知')
-                            time_val = item.get('start', {}).get('dateTime')
+                            start_val = item.get('start', {}).get('dateTime')
+                            end_val = item.get('end', {}).get('dateTime')
                             item_type = item.get('type', 'Event')
-                            if item.get('isCancelled'): item_type += " (Cancelled)"
 
-                        row_data = {
-                            'UserPrincipalName': user,
-                            'ItemId': item_id,
-                            'Subject': subject,
-                            'Sender/Organizer': sender,
-                            'Time': time_val,
-                            'Type': item_type,
-                            'Action': 'ReportOnly' if report_only else 'Delete',
-                            'Status': 'Pending',
-                            'Details': ''
-                        }
+                            attendees = item.get('attendees', []) or []
+                            attendee_emails = []
+                            for a in attendees:
+                                addr = (a.get('emailAddress') or {}).get('address')
+                                if addr:
+                                    attendee_emails.append(addr)
+
+                            response_status = item.get('responseStatus', {}).get('response', '')
+                            is_cancelled = bool(item.get('isCancelled'))
+                            ical_uid = item.get('iCalUId', '')
+                            series_master_id = item.get('seriesMasterId', '')
+
+                            goid_b64 = ''
+                            try:
+                                props = item.get('singleValueExtendedProperties') or []
+                                if props:
+                                    # Graph returns base64 for Binary extended properties
+                                    goid_b64 = props[0].get('value', '') or ''
+                            except Exception:
+                                goid_b64 = ''
+
+                            row_data = {
+                                'UserPrincipalName': user,
+                                'Subject': subject,
+                                'Type': item_type,
+                                'MeetingGOID': goid_b64,
+                                'CleanGOID': (goid_b64 or ical_uid or item_id),
+                                'iCalUId': ical_uid,
+                                'SeriesMasterId': series_master_id,
+                                'Organizer': sender,
+                                'Attendees': ';'.join(attendee_emails),
+                                'Start': start_val,
+                                'End': end_val,
+                                'UserRole': '',
+                                'IsCancelled': is_cancelled,
+                                'ResponseStatus': response_status,
+                                'RecurrencePattern': '',
+                                'PatternDetails': '',
+                                'RecurrenceDuration': '',
+                                'IsEndless': '',
+                                'Action': 'ReportOnly' if report_only else 'Delete',
+                                'Status': 'Pending',
+                                'Details': ''
+                            }
+
+                            if is_cancelled:
+                                row_data['Type'] = f"{row_data['Type']} (Cancelled)"
+
+                            # Best-effort: if this is an occurrence/exception and has seriesMasterId,
+                            # pull recurrence from master (cache per user) to align with EWS report.
+                            try:
+                                if (item_type in ('occurrence', 'exception') or 'occurrence' in str(item_type).lower() or 'exception' in str(item_type).lower()) and series_master_id:
+                                    if not hasattr(self, '_graph_master_cache'):
+                                        self._graph_master_cache = {}
+                                    user_cache = self._graph_master_cache.setdefault(user, {})
+                                    if series_master_id not in user_cache:
+                                        master_url = f"{graph_endpoint}/v1.0/users/{user}/events/{series_master_id}"
+                                        master_params = {
+                                            "$select": "id,type,recurrence,iCalUId",
+                                        }
+                                        m_resp = requests.get(master_url, headers=headers, params=master_params)
+                                        if m_resp.status_code == 200:
+                                            user_cache[series_master_id] = m_resp.json()
+                                        else:
+                                            user_cache[series_master_id] = None
+                                    master_obj = user_cache.get(series_master_id)
+                                    if master_obj and master_obj.get('recurrence'):
+                                        rec = master_obj.get('recurrence')
+                                        pattern = (rec.get('pattern') or {})
+                                        rng = (rec.get('range') or {})
+                                        row_data['RecurrencePattern'] = pattern.get('type', '')
+                                        row_data['PatternDetails'] = json.dumps(pattern, ensure_ascii=False)
+                                        row_data['RecurrenceDuration'] = json.dumps(rng, ensure_ascii=False)
+                                        row_data['IsEndless'] = (rng.get('type') == 'noEnd')
+                            except Exception:
+                                pass
+
+                        if target_type == "Email":
+                            row_data = {
+                                'UserPrincipalName': user,
+                                'ItemId': item_id,
+                                'Subject': subject,
+                                'Sender/Organizer': sender,
+                                'Time': time_val,
+                                'Type': item_type,
+                                'Action': 'ReportOnly' if report_only else 'Delete',
+                                'Status': 'Pending',
+                                'Details': ''
+                            }
 
                         if report_only:
                             self.log(f"  [报告] 发现: {subject} ({item_type})")
@@ -1644,7 +1753,7 @@ class UniversalEmailCleanerApp:
                             row_data['Details'] = '仅报告模式'
                         else:
                             self.log(f"  正在删除: {subject}")
-                            del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
+                            del_url = f"{graph_endpoint}/v1.0/users/{user}/{delete_resource}/{item_id}"
                             
                             if self.log_level_var.get() == "Advanced":
                                 self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
@@ -1723,7 +1832,16 @@ class UniversalEmailCleanerApp:
             target_type = self.cleanup_target_var.get()
             
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                fieldnames = ['UserPrincipalName', 'ItemId', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
+                if target_type == "Meeting":
+                    fieldnames = [
+                        'UserPrincipalName', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
+                        'iCalUId', 'SeriesMasterId',
+                        'Organizer', 'Attendees', 'Start', 'End', 'UserRole',
+                        'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
+                        'Action', 'Status', 'Details'
+                    ]
+                else:
+                    fieldnames = ['UserPrincipalName', 'ItemId', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
 
@@ -1739,15 +1857,16 @@ class UniversalEmailCleanerApp:
                 # Target Specific Logic
                 if target_type == "Email":
                     resource = "messages"
+                    delete_resource = "messages"
                     if self.criteria_msg_id.get(): filters.append(f"internetMessageId eq '{self.criteria_msg_id.get()}'")
                     if self.criteria_sender.get(): filters.append(f"from/emailAddress/address eq '{self.criteria_sender.get()}'")
                     if start_date: filters.append(f"receivedDateTime ge {start_date}T00:00:00Z")
                     if end_date: filters.append(f"receivedDateTime le {end_date}T23:59:59Z")
                 else: # Meeting
-                    resource = "events" # or calendar/events
+                    resource = "calendarView"
+                    delete_resource = "events"
                     if self.criteria_sender.get(): filters.append(f"organizer/emailAddress/address eq '{self.criteria_sender.get()}'")
-                    if start_date: filters.append(f"start/dateTime ge '{start_date}T00:00:00'")
-                    if end_date: filters.append(f"end/dateTime le '{end_date}T23:59:59'")
+                    # calendarView uses startDateTime/endDateTime query params for time window; keep filter for additional criteria only
                     
                     # Meeting Specifics
                     if self.meeting_only_cancelled_var.get():
@@ -1757,11 +1876,19 @@ class UniversalEmailCleanerApp:
                     if "Single" in scope:
                         filters.append("type eq 'singleInstance'")
                     elif "Series" in scope:
-                        filters.append("type eq 'seriesMaster'")
+                        # Include expanded instances too (occurrence/exception) for EWS-like scan
+                        filters.append("type eq 'seriesMaster' or type eq 'occurrence' or type eq 'exception'")
                     # If All, no type filter
 
                 filter_str = " and ".join(filters)
                 body_keyword = self.criteria_body.get()
+
+                calendar_view_start = None
+                calendar_view_end = None
+                if target_type == "Meeting":
+                    # Use UTC ISO; calendarView requires both
+                    calendar_view_start = f"{start_date}T00:00:00Z" if start_date else None
+                    calendar_view_end = f"{end_date}T23:59:59Z" if end_date else None
 
                 csv_lock = threading.Lock()
                 report_only = self.report_only_var.get()
@@ -1771,7 +1898,8 @@ class UniversalEmailCleanerApp:
                     for user in users:
                         futures.append(executor.submit(
                             self.process_single_user_graph, 
-                            user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock
+                            user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
+                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end
                         ))
                     
                     # Wait for all to complete
