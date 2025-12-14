@@ -18,7 +18,7 @@ import webbrowser
 import base64
 import io
 
-APP_VERSION = "v1.5.5"
+APP_VERSION = "v1.5.6"
 GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
 GITHUB_PROFILE_URL = "https://github.com/andylu1988"
 
@@ -551,19 +551,39 @@ class Logger:
     def __init__(self, log_area, log_dir):
         self.log_area = log_area
         self.log_dir = log_dir
-        self.level = "NORMAL" # NORMAL or ADVANCED
+        self.level = "NORMAL" # NORMAL / ADVANCED / EXPERT
         self.file_lock = threading.Lock()
 
-    def _get_log_file_path(self):
+    def _level_rank(self, level):
+        mapping = {"NORMAL": 0, "ADVANCED": 1, "EXPERT": 2}
+        return mapping.get((level or "").upper(), 0)
+
+    def _get_log_file_path(self, kind="app"):
         date_str = datetime.now().strftime("%Y-%m-%d")
+        if kind == "advanced":
+            return os.path.join(self.log_dir, f"app_advanced_{date_str}.log")
+        if kind == "expert":
+            return os.path.join(self.log_dir, f"app_expert_{date_str}.log")
         return os.path.join(self.log_dir, f"app_{date_str}.log")
 
+    def get_current_debug_log_path(self):
+        if self.level == "ADVANCED":
+            return self._get_log_file_path("advanced")
+        if self.level == "EXPERT":
+            return self._get_log_file_path("expert")
+        return ""
+
     def set_level(self, level):
-        self.level = level
+        # Accept GUI values: Normal/Advanced/Expert
+        val = (level or "NORMAL").upper()
+        if val in ("NORMAL", "ADVANCED", "EXPERT"):
+            self.level = val
+        else:
+            self.level = "NORMAL"
 
     def log(self, message, level="INFO", is_advanced=False):
         # If message is advanced but current level is NORMAL, skip
-        if is_advanced and self.level != "ADVANCED":
+        if is_advanced and self._level_rank(self.level) < self._level_rank("ADVANCED"):
             return
 
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -582,28 +602,42 @@ class Logger:
         
         # File Write
         try:
-            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(log_path, "a", encoding="utf-8") as f:
+                # Always write normal log
+                with open(self._get_log_file_path("app"), "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
-        except:
+
+                # Advanced/Expert go to their own debug logs (separate from normal)
+                if is_advanced:
+                    dbg_path = self.get_current_debug_log_path()
+                    if dbg_path:
+                        with open(dbg_path, "a", encoding="utf-8") as f:
+                            f.write(full_msg + "\n")
+        except Exception:
             pass
 
-    def log_to_file_only(self, message):
-        """Writes directly to file, skipping GUI. Useful for large debug dumps."""
+    def log_to_file_only(self, message, min_level="ADVANCED"):
+        """Writes directly to debug file (advanced/expert), skipping GUI."""
+        if self._level_rank(self.level) < self._level_rank(min_level):
+            return
+
+        dbg_path = self.get_current_debug_log_path()
+        if not dbg_path:
+            return
+
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] [DEBUG_DATA] {message}"
         try:
-            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(log_path, "a", encoding="utf-8") as f:
+                with open(dbg_path, "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
-        except:
+        except Exception:
             pass
 
 class EwsTraceAdapter(NoVerifyHTTPAdapter):
     logger = None
     log_responses = True  # Default to True, can be disabled for "Advanced" mode
+    response_log_path = None
     
     def send(self, request, *args, **kwargs):
         # Resolve stream argument - NTLM auth needs stream=True internally
@@ -651,9 +685,12 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
                     content = response.content 
                     
                     # Write immediately to file
-                    docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
-                    os.makedirs(docs_dir, exist_ok=True)
-                    log_path = os.path.join(docs_dir, "ews_getitem_responses.log")
+                    log_path = self.response_log_path
+                    if not log_path:
+                        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
+                        os.makedirs(docs_dir, exist_ok=True)
+                        date_str = datetime.now().strftime("%Y-%m-%d")
+                        log_path = os.path.join(docs_dir, f"ews_getitem_responses_expert_{date_str}.log")
                     
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n\n{'='*80}\n")
@@ -713,19 +750,24 @@ class UniversalEmailCleanerApp:
         # 日志配置子菜单
         log_menu = tk.Menu(tools_menu, tearoff=0)
         self.log_level_var = tk.StringVar(value="Normal") # Normal, Advanced, Expert
-        
-        def on_log_level_change():
+
+        def on_log_level_change_request():
+            # Shared handler for Tools menu and main UI
             val = self.log_level_var.get()
             if val == "Expert":
                 confirm = messagebox.askyesno("警告", "日志排错专用，日志量会很大且包含敏感信息，慎选！\n\n确认开启专家模式吗？")
                 if not confirm:
                     self.log_level_var.set("Normal")
                     return
-            # Sync with UI combobox if it exists (it will be created later, so we bind variable)
-            
-        log_menu.add_radiobutton(label="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_change)
-        log_menu.add_radiobutton(label="高级 (Advanced - 仅记录 EWS 请求)", variable=self.log_level_var, value="Advanced", command=on_log_level_change)
-        log_menu.add_radiobutton(label="专家 (Expert - 记录 EWS 请求和响应)", variable=self.log_level_var, value="Expert", command=on_log_level_change)
+            # Update runtime logger immediately
+            try:
+                self.logger.set_level(self.log_level_var.get())
+            except Exception:
+                pass
+        
+        log_menu.add_radiobutton(label="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_change_request)
+        log_menu.add_radiobutton(label="高级 (Advanced - 记录 Graph/EWS 请求)", variable=self.log_level_var, value="Advanced", command=on_log_level_change_request)
+        log_menu.add_radiobutton(label="专家 (Expert - 记录 Graph/EWS 请求和响应)", variable=self.log_level_var, value="Expert", command=on_log_level_change_request)
         
         tools_menu.add_cascade(label="日志配置 (Log Level)", menu=log_menu)
         menubar.add_cascade(label="工具 (Tools)", menu=tools_menu)
@@ -831,6 +873,7 @@ class UniversalEmailCleanerApp:
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
         
         self.logger = Logger(self.log_area, self.documents_dir)
+        self.logger.set_level(self.log_level_var.get())
 
         # Links
         self.link_frame = ttk.Frame(log_frame)
@@ -1460,11 +1503,17 @@ class UniversalEmailCleanerApp:
         ttk.Label(opt_frame, text="| 日志级别:").pack(side="left", padx=5)
         
         def on_log_level_click():
+            # Delegate to shared handler from Tools menu
             val = self.log_level_var.get()
             if val == "Expert":
                 confirm = messagebox.askyesno("警告", "日志排错专用，日志量会很大且包含敏感信息，慎选！\n\n确认开启专家模式吗？")
                 if not confirm:
                     self.log_level_var.set("Normal")
+                    return
+            try:
+                self.logger.set_level(self.log_level_var.get())
+            except Exception:
+                pass
 
         ttk.Radiobutton(opt_frame, text="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_click).pack(side="left", padx=5)
         ttk.Radiobutton(opt_frame, text="高级 (Advanced)", variable=self.log_level_var, value="Advanced", command=on_log_level_click).pack(side="left", padx=5)
@@ -1711,18 +1760,25 @@ class UniversalEmailCleanerApp:
                 req_headers["ConsistencyLevel"] = "eventual"
             
             while url:
-                if self.log_level_var.get() == "Advanced":
+                graph_log_level = self.log_level_var.get()
+                if graph_log_level in ("Advanced", "Expert"):
                     self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
                     self.logger.log_to_file_only(f"HEADERS: {json.dumps(req_headers, default=str)}")
-                    if params: self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
+                    if params:
+                        self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
 
                 self.log(f"请求: GET {url} | 参数: {params}", is_advanced=True)
                 resp = requests.get(url, headers=req_headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
                 
-                if self.log_level_var.get() == "Advanced":
+                if graph_log_level in ("Advanced", "Expert"):
                     self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
                     self.logger.log_to_file_only(f"HEADERS: {json.dumps(dict(resp.headers), default=str)}")
-                    self.logger.log_to_file_only(f"BODY: {resp.text}")
+                    body_text = resp.text or ""
+                    if graph_log_level == "Advanced":
+                        body_text = body_text[:4096]
+                    else:
+                        body_text = body_text[:50000]
+                    self.logger.log_to_file_only(f"BODY: {body_text}")
                 
                 if resp.status_code != 200:
                     self.log(f"  X 查询失败: {resp.text}", "ERROR")
@@ -1889,16 +1945,21 @@ class UniversalEmailCleanerApp:
                             self.log(f"  正在删除: {subject}")
                             del_url = f"{graph_endpoint}/v1.0/users/{user}/{delete_resource}/{item_id}"
                             
-                            if self.log_level_var.get() == "Advanced":
+                            if graph_log_level in ("Advanced", "Expert"):
                                 self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
                                 self.logger.log_to_file_only(f"HEADERS: {json.dumps(req_headers, default=str)}")
 
                             self.log(f"请求: DELETE {del_url}", is_advanced=True)
                             del_resp = requests.delete(del_url, headers=req_headers)
                             
-                            if self.log_level_var.get() == "Advanced":
+                            if graph_log_level in ("Advanced", "Expert"):
                                 self.logger.log_to_file_only(f"GRAPH RESP: {del_resp.status_code}")
-                                self.logger.log_to_file_only(f"BODY: {del_resp.text}")
+                                body_text = del_resp.text or ""
+                                if graph_log_level == "Advanced":
+                                    body_text = body_text[:4096]
+                                else:
+                                    body_text = body_text[:50000]
+                                self.logger.log_to_file_only(f"BODY: {body_text}")
                             
                             if del_resp.status_code == 204:
                                 self.log("    √ 已删除")
@@ -2414,14 +2475,18 @@ class UniversalEmailCleanerApp:
             messagebox.showerror("错误", f"无法加载 EWS 模块 (exchangelib)。\n错误信息: {EXCHANGELIB_ERROR}")
             return
 
-        # Configure Advanced Logging for EWS
+        # Configure Advanced/Expert Logging for EWS
         ews_log_handlers = []
         log_level = self.log_level_var.get()
         
         if log_level in ("Advanced", "Expert"):
             try:
                 # Create Handler
-                file_handler = logging.FileHandler(self.log_file_path, encoding='utf-8')
+                # Route EWS trace into level-specific debug log file
+                debug_path = self.logger.get_current_debug_log_path() if self.logger else None
+                if not debug_path:
+                    debug_path = os.path.join(self.documents_dir, "app_advanced_fallback.log")
+                file_handler = logging.FileHandler(debug_path, encoding='utf-8')
                 # We use a simple formatter because the TraceAdapter handles the XML formatting
                 file_handler.setFormatter(logging.Formatter('%(message)s')) 
                 ews_log_handlers.append(file_handler)
@@ -2434,14 +2499,17 @@ class UniversalEmailCleanerApp:
                 # Inject Adapter
                 EwsTraceAdapter.logger = trace_logger
                 EwsTraceAdapter.log_responses = (log_level == "Expert")
+                if log_level == "Expert":
+                    date_str = datetime.now().strftime("%Y-%m-%d")
+                    EwsTraceAdapter.response_log_path = os.path.join(self.documents_dir, f"ews_getitem_responses_expert_{date_str}.log")
+                else:
+                    EwsTraceAdapter.response_log_path = None
                 BaseProtocol.HTTP_ADAPTER_CLS = EwsTraceAdapter
                 
                 # Check permission for response log if Expert
                 if log_level == "Expert":
                     try:
-                        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
-                        os.makedirs(docs_dir, exist_ok=True)
-                        test_path = os.path.join(docs_dir, "ews_getitem_responses.log")
+                        test_path = EwsTraceAdapter.response_log_path
                         with open(test_path, "a", encoding="utf-8") as f:
                             pass
                         self.log(f"EWS 响应日志将写入: {test_path}", is_advanced=True)
@@ -2563,6 +2631,7 @@ class UniversalEmailCleanerApp:
             # Reset Adapter
             BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
             EwsTraceAdapter.logger = None
+            EwsTraceAdapter.response_log_path = None
 
 if __name__ == "__main__":
     root = tk.Tk()

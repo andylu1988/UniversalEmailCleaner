@@ -1,3 +1,9 @@
+## v1.5.6 (2025-12-14)
+- **高级/专家日志分开记录**：新增按日滚动的 `app_advanced_YYYY-MM-DD.log` 与 `app_expert_YYYY-MM-DD.log`，用于分别记录高级与专家排错信息。
+- **Graph REST 排错日志增强**：Advanced/Expert 级别都会记录 Graph 请求/响应详情（Advanced 记录摘要并截断 body；Expert 记录更完整内容并截断至 50KB）。
+- **EWS Trace 路由优化**：EWS 的 Trace 输出会写入当前级别对应的 Advanced/Expert 日志文件；Expert 的 GetItem 响应单独写入 `ews_getitem_responses_expert_YYYY-MM-DD.log`。
+- **主界面与工具菜单联动 + Expert 警告**：日志级别在主界面与 Tools 菜单保持同步；选择 Expert 会弹出安全警告确认。
+
 ## v1.5.5 (2025-12-14)
 - **Graph 会议展开逻辑对齐 EWS**：不填写日期范围时，Graph 与 EWS 一样不展开循环实例（仅扫描主项/单次）；填写开始+结束日期后才使用 `calendarView` 在范围内展开 occurrence/exception。
 - **GOID 显示修正**：`MeetingGOID` 对齐为 `iCalUId`（与 EWS 报告一致）；同时最佳努力读取 GlobalObjectId（MAPI 扩展属性）并以更易读形式写入 Details。
