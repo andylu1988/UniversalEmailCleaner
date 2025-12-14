@@ -18,7 +18,7 @@ import webbrowser
 import base64
 import io
 
-APP_VERSION = "v1.5.7"
+APP_VERSION = "v1.5.8"
 GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
 GITHUB_PROFILE_URL = "https://github.com/andylu1988"
 
@@ -547,7 +547,7 @@ def decode_graph_goid_base64_to_hex(goid_b64):
         return ""
 
 
-def redact_sensitive_headers(headers):
+def redact_sensitive_headers(headers, save_authorization=False):
     """Mask sensitive auth material before writing debug logs."""
     if not isinstance(headers, dict) or not headers:
         return {}
@@ -556,10 +556,13 @@ def redact_sensitive_headers(headers):
     for k, v in headers.items():
         key_lower = (k or "").lower()
         if key_lower == "authorization":
-            if isinstance(v, str) and v.lower().startswith("bearer "):
-                redacted[k] = "Bearer ***"
+            if save_authorization:
+                redacted[k] = v
             else:
-                redacted[k] = "***"
+                if isinstance(v, str) and v.lower().startswith("bearer "):
+                    redacted[k] = "Bearer ***"
+                else:
+                    redacted[k] = "***"
         else:
             redacted[k] = v
     return redacted
@@ -791,6 +794,7 @@ class UniversalEmailCleanerApp:
         # 日志配置子菜单
         log_menu = tk.Menu(tools_menu, tearoff=0)
         self.log_level_var = tk.StringVar(value="Normal") # Normal, Advanced, Expert
+        self.graph_save_auth_token_var = tk.BooleanVar(value=False)
 
         def on_log_level_change_request():
             # Shared handler for Tools menu and main UI
@@ -805,10 +809,40 @@ class UniversalEmailCleanerApp:
                 self.logger.set_level(self.log_level_var.get())
             except Exception:
                 pass
+
+            # If leaving Expert, force auth token saving OFF to stay safe
+            if self.log_level_var.get() != "Expert":
+                try:
+                    self.graph_save_auth_token_var.set(False)
+                except Exception:
+                    pass
+
+        def on_graph_save_auth_toggle():
+            if not self.graph_save_auth_token_var.get():
+                return
+
+            if self.log_level_var.get() != "Expert":
+                messagebox.showwarning("提示", "该选项仅在 Expert 日志级别下生效。\n\n请先将日志级别切换为 Expert。")
+                self.graph_save_auth_token_var.set(False)
+                return
+
+            confirm = messagebox.askyesno(
+                "高风险警告",
+                "开启后会在 Expert 日志中保存 Authorization Token，存在敏感信息泄漏风险。\n\n确认开启吗？"
+            )
+            if not confirm:
+                self.graph_save_auth_token_var.set(False)
         
         log_menu.add_radiobutton(label="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_change_request)
         log_menu.add_radiobutton(label="高级 (Advanced - 记录 Graph/EWS 请求)", variable=self.log_level_var, value="Advanced", command=on_log_level_change_request)
         log_menu.add_radiobutton(label="专家 (Expert - 记录 Graph/EWS 请求和响应)", variable=self.log_level_var, value="Expert", command=on_log_level_change_request)
+
+        log_menu.add_separator()
+        log_menu.add_checkbutton(
+            label="Graph Expert 保存 Authorization Token (危险)",
+            variable=self.graph_save_auth_token_var,
+            command=on_graph_save_auth_toggle,
+        )
         
         tools_menu.add_cascade(label="日志配置 (Log Level)", menu=log_menu)
         menubar.add_cascade(label="工具 (Tools)", menu=tools_menu)
@@ -1803,8 +1837,9 @@ class UniversalEmailCleanerApp:
             while url:
                 graph_log_level = self.log_level_var.get()
                 if graph_log_level in ("Advanced", "Expert"):
+                    save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
                     self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
-                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers), default=str)}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
                     if params:
                         self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
 
@@ -1993,8 +2028,9 @@ class UniversalEmailCleanerApp:
                             del_url = f"{graph_endpoint}/v1.0/users/{user}/{delete_resource}/{item_id}"
                             
                             if graph_log_level in ("Advanced", "Expert"):
+                                save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
                                 self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
-                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers), default=str)}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
 
                             self.log(f"请求: DELETE {del_url}", is_advanced=True)
                             del_resp = requests.delete(del_url, headers=req_headers)

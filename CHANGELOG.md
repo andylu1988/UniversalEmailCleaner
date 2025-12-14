@@ -1,3 +1,6 @@
+## v1.5.8 (2025-12-14)
+- **Graph Expert 可选保存 Token**：Tools → 日志配置中新增“Graph Expert 保存 Authorization Token (危险)”开关（默认关闭）。开启时会弹出高风险警告，且仅在 Expert 级别下生效。
+
 ## v1.5.7 (2025-12-14)
 - **Graph 日志脱敏**：Advanced/Expert 的 Graph REST 日志中，`Authorization` 会自动打码（`Bearer ***`），避免 Token 泄漏。
 - **ResponseStatus 逻辑修正**：
