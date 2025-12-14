@@ -14,6 +14,19 @@ import traceback
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
 import calendar
+import webbrowser
+import base64
+import io
+
+APP_VERSION = "v1.5.3"
+GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
+GITHUB_PROFILE_URL = "https://github.com/andylu1988"
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
 
 # DPI Awareness
 try:
@@ -58,26 +71,36 @@ except ImportError as e:
     IMPERSONATION = None
 
 class DateEntry(ttk.Frame):
-    def __init__(self, master, textvariable, **kwargs):
+    def __init__(self, master, textvariable, mode_var=None, other_date_var=None, **kwargs):
         super().__init__(master, **kwargs)
         self.variable = textvariable
+        self.mode_var = mode_var
+        self.other_date_var = other_date_var
         self.entry = ttk.Entry(self, textvariable=self.variable, width=15)
         self.entry.pack(side="left", fill="x", expand=True)
+        # Bind click event to open calendar
+        self.entry.bind("<Button-1>", lambda e: self.open_calendar())
+        
         self.btn = ttk.Button(self, text="📅", width=3, command=self.open_calendar)
         self.btn.pack(side="left", padx=(2, 0))
 
     def open_calendar(self):
-        top = tk.Toplevel(self)
-        top.title("选择日期")
-        top.geometry("250x250")
-        top.grab_set()
+        # Check if calendar is already open
+        if hasattr(self, 'top') and self.top.winfo_exists():
+            self.top.lift()
+            return
+
+        self.top = tk.Toplevel(self)
+        self.top.title("选择日期")
+        self.top.geometry("280x280")
+        self.top.grab_set()
         
         # Center popup
         x = self.winfo_rootx()
         y = self.winfo_rooty() + self.winfo_height()
-        top.geometry(f"+{x}+{y}")
+        self.top.geometry(f"+{x}+{y}")
 
-        cal_frame = ttk.Frame(top)
+        cal_frame = ttk.Frame(self.top)
         cal_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
         now = datetime.now()
@@ -87,24 +110,89 @@ class DateEntry(ttk.Frame):
                 current_date = datetime.strptime(self.variable.get(), "%Y-%m-%d")
         except:
             pass
+
+        # For Meeting mode, use the other side date as reference for the +/- 2 year selectable window
+        self._meeting_ref_date = None
+        if self.mode_var and self.mode_var.get() == "Meeting":
+            ref_raw = None
+            try:
+                if self.other_date_var and self.other_date_var.get():
+                    ref_raw = self.other_date_var.get()
+            except Exception:
+                ref_raw = None
+
+            if ref_raw:
+                try:
+                    self._meeting_ref_date = datetime.strptime(ref_raw, "%Y-%m-%d").date()
+                except Exception:
+                    self._meeting_ref_date = None
+
+            if self._meeting_ref_date is None:
+                try:
+                    if self.variable.get():
+                        self._meeting_ref_date = datetime.strptime(self.variable.get(), "%Y-%m-%d").date()
+                except Exception:
+                    self._meeting_ref_date = None
+
+            if self._meeting_ref_date is None:
+                self._meeting_ref_date = datetime.now().date()
         
         self.cal_year = tk.IntVar(value=current_date.year)
         self.cal_month = tk.IntVar(value=current_date.month)
         
-        # Header
+        # Header with Year/Month navigation + quick selectors
         header = ttk.Frame(cal_frame)
         header.pack(fill="x", pady=5)
         
+        # Nav
+        ttk.Button(header, text="<<", width=3, command=lambda: self.change_year(-1, cal_grid)).pack(side="left")
         ttk.Button(header, text="<", width=2, command=lambda: self.change_month(-1, cal_grid)).pack(side="left")
-        self.lbl_header = ttk.Label(header, text=f"{self.cal_year.get()}年 {self.cal_month.get()}月", anchor="center")
-        self.lbl_header.pack(side="left", fill="x", expand=True)
+
+        # Quick selectors
+        year_values = None
+        if self.mode_var and self.mode_var.get() == "Meeting" and getattr(self, "_meeting_ref_date", None):
+            y0 = self._meeting_ref_date.year
+            year_values = [str(y) for y in range(y0 - 2, y0 + 3)]
+        else:
+            y0 = current_date.year
+            year_values = [str(y) for y in range(y0 - 10, y0 + 11)]
+
+        self.year_cb = ttk.Combobox(header, values=year_values, width=6, state="readonly")
+        self.year_cb.set(str(self.cal_year.get()))
+        self.year_cb.pack(side="left", padx=(6, 2))
+
+        self.month_cb = ttk.Combobox(header, values=[f"{m:02d}" for m in range(1, 13)], width=4, state="readonly")
+        self.month_cb.set(f"{self.cal_month.get():02d}")
+        self.month_cb.pack(side="left", padx=(2, 6))
+
+        def _on_year_month_change(_evt=None):
+            try:
+                y = int(self.year_cb.get())
+                m = int(self.month_cb.get())
+            except Exception:
+                return
+            self.cal_year.set(y)
+            self.cal_month.set(m)
+            self.render_calendar(cal_grid, self.top)
+
+        self.year_cb.bind("<<ComboboxSelected>>", _on_year_month_change)
+        self.month_cb.bind("<<ComboboxSelected>>", _on_year_month_change)
+
         ttk.Button(header, text=">", width=2, command=lambda: self.change_month(1, cal_grid)).pack(side="left")
+        ttk.Button(header, text=">>", width=3, command=lambda: self.change_year(1, cal_grid)).pack(side="left")
 
         # Grid
         cal_grid = ttk.Frame(cal_frame)
         cal_grid.pack(fill="both", expand=True)
         
-        self.render_calendar(cal_grid, top)
+        self.render_calendar(cal_grid, self.top)
+
+    def change_year(self, delta, grid_frame):
+        y = self.cal_year.get() + delta
+        self.cal_year.set(y)
+        if hasattr(self, "year_cb"):
+            self.year_cb.set(str(y))
+        self.render_calendar(grid_frame, grid_frame.winfo_toplevel())
 
     def change_month(self, delta, grid_frame):
         m = self.cal_month.get() + delta
@@ -117,7 +205,10 @@ class DateEntry(ttk.Frame):
             y += 1
         self.cal_year.set(y)
         self.cal_month.set(m)
-        self.lbl_header.config(text=f"{y}年 {m}月")
+        if hasattr(self, "year_cb"):
+            self.year_cb.set(str(y))
+        if hasattr(self, "month_cb"):
+            self.month_cb.set(f"{m:02d}")
         self.render_calendar(grid_frame, grid_frame.winfo_toplevel())
 
     def render_calendar(self, frame, top):
@@ -129,10 +220,28 @@ class DateEntry(ttk.Frame):
             ttk.Label(frame, text=d, anchor="center").grid(row=0, column=i, sticky="nsew")
             
         cal = calendar.monthcalendar(self.cal_year.get(), self.cal_month.get())
+        
+        # Determine valid date range if in Meeting mode
+        min_date = None
+        max_date = None
+        if self.mode_var and self.mode_var.get() == "Meeting":
+            ref_d = getattr(self, "_meeting_ref_date", None) or datetime.now().date()
+            min_date = ref_d - timedelta(days=365*2)
+            max_date = ref_d + timedelta(days=365*2)
+
         for r, week in enumerate(cal):
             for c, day in enumerate(week):
                 if day != 0:
-                    btn = tk.Button(frame, text=str(day), relief="flat", 
+                    state = "normal"
+                    if min_date and max_date:
+                        try:
+                            current_d = datetime(self.cal_year.get(), self.cal_month.get(), day).date()
+                            if not (min_date <= current_d <= max_date):
+                                state = "disabled"
+                        except ValueError:
+                            pass
+
+                    btn = tk.Button(frame, text=str(day), relief="flat", state=state,
                                     command=lambda d=day: self.select_date(d, top))
                     btn.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
         
@@ -467,7 +576,7 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
 class UniversalEmailCleanerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("通用邮件清理工具 v1.5.0 (Graph API & EWS)")
+        self.root.title(f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)")
         self.root.geometry("1100x900")
         self.root.minsize(900, 700)
         
@@ -686,7 +795,70 @@ class UniversalEmailCleanerApp:
         txt.config(state='disabled')
 
     def show_about(self):
-        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.4.0\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
+        about = tk.Toplevel(self.root)
+        about.title("关于")
+        about.resizable(False, False)
+        about.geometry("520x260")
+        about.transient(self.root)
+        about.grab_set()
+
+        outer = ttk.Frame(about, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+
+        avatar_lbl = ttk.Label(top)
+        avatar_lbl.pack(side="left", padx=(0, 12))
+
+        text_col = ttk.Frame(top)
+        text_col.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(text_col, text=f"通用邮件清理工具 (Universal Email Cleaner) {APP_VERSION}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(text_col, text="支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。", justify="left").pack(anchor="w", pady=(6, 8))
+
+        link = tk.Label(text_col, text=GITHUB_PROJECT_URL, fg="#1a73e8", cursor="hand2")
+        try:
+            link.configure(font=("Segoe UI", 10, "underline"))
+        except Exception:
+            pass
+        link.pack(anchor="w")
+        link.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_PROJECT_URL))
+
+        ttk.Label(text_col, text=f"GitHub: {GITHUB_PROFILE_URL}").pack(anchor="w", pady=(6, 0))
+
+        # Load avatar from avatar_b64.txt (preferred) and show it if Pillow is available
+        def _try_load_avatar_b64():
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(base_dir, "avatar_b64.txt"),
+            ]
+            if getattr(sys, 'frozen', False):
+                candidates.append(os.path.join(sys._MEIPASS, "avatar_b64.txt"))
+
+            for p in candidates:
+                try:
+                    if os.path.exists(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            return f.read().strip()
+                except Exception:
+                    continue
+            return None
+
+        avatar_b64 = _try_load_avatar_b64()
+        if avatar_b64 and Image is not None and ImageTk is not None:
+            try:
+                raw = base64.b64decode(avatar_b64)
+                img = Image.open(io.BytesIO(raw)).convert("RGBA")
+                img = img.resize((88, 88))
+                about._avatar_img = ImageTk.PhotoImage(img)
+                avatar_lbl.configure(image=about._avatar_img)
+            except Exception:
+                pass
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="关闭", command=about.destroy).pack(side="right")
 
     # --- Config Management ---
     def load_config(self):
@@ -752,7 +924,7 @@ class UniversalEmailCleanerApp:
         ttk.Radiobutton(type_frame, text="Microsoft Graph API", variable=self.source_type_var, value="Graph", command=self.toggle_connection_ui).pack(side="left", padx=20, pady=10)
 
         # 2. EWS Configuration Frame
-        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange 2010-2019 / Online)")
+        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange On-Premise)")
         self.ews_frame.pack(fill="x", pady=5, ipady=5)
         
         ews_grid = ttk.Frame(self.ews_frame)
@@ -1151,10 +1323,12 @@ class UniversalEmailCleanerApp:
         ttk.Entry(self.filter_frame, textvariable=self.criteria_sender, width=30).grid(row=1, column=3, **grid_opts)
 
         ttk.Label(self.filter_frame, text="开始日期 (YYYY-MM-DD):").grid(row=2, column=0, **grid_opts)
-        DateEntry(self.filter_frame, textvariable=self.criteria_start_date).grid(row=2, column=1, **grid_opts)
+        self.start_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_start_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_end_date)
+        self.start_date_entry.grid(row=2, column=1, **grid_opts)
         
         ttk.Label(self.filter_frame, text="结束日期 (YYYY-MM-DD):").grid(row=2, column=2, **grid_opts)
-        DateEntry(self.filter_frame, textvariable=self.criteria_end_date).grid(row=2, column=3, **grid_opts)
+        self.end_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_end_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_start_date)
+        self.end_date_entry.grid(row=2, column=3, **grid_opts)
 
         self.lbl_body = ttk.Label(self.filter_frame, text="正文包含:")
         self.lbl_body.grid(row=3, column=0, **grid_opts)
