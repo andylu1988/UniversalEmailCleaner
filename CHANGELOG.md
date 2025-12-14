@@ -1,3 +1,50 @@
+## v1.5.8 (2025-12-14)
+- **Graph Expert 可选保存 Token**：Tools → 日志配置中新增“Graph Expert 保存 Authorization Token (危险)”开关（默认关闭）。开启时会弹出高风险警告，且仅在 Expert 级别下生效。
+
+## v1.5.7 (2025-12-14)
+- **Graph 日志脱敏**：Advanced/Expert 的 Graph REST 日志中，`Authorization` 会自动打码（`Bearer ***`），避免 Token 泄漏。
+- **ResponseStatus 逻辑修正**：
+  - `UserRole=Organizer` 时，`ResponseStatus` 输出参会者（Attendees）的响应状态；
+  - `UserRole=Attendee` 时，`ResponseStatus` 输出当前用户自己的响应状态。
+
+## v1.5.6 (2025-12-14)
+- **高级/专家日志分开记录**：新增按日滚动的 `app_advanced_YYYY-MM-DD.log` 与 `app_expert_YYYY-MM-DD.log`，用于分别记录高级与专家排错信息。
+- **Graph REST 排错日志增强**：Advanced/Expert 级别都会记录 Graph 请求/响应详情（Advanced 记录摘要并截断 body；Expert 记录更完整内容并截断至 50KB）。
+- **EWS Trace 路由优化**：EWS 的 Trace 输出会写入当前级别对应的 Advanced/Expert 日志文件；Expert 的 GetItem 响应单独写入 `ews_getitem_responses_expert_YYYY-MM-DD.log`。
+- **主界面与工具菜单联动 + Expert 警告**：日志级别在主界面与 Tools 菜单保持同步；选择 Expert 会弹出安全警告确认。
+
+## v1.5.5 (2025-12-14)
+- **Graph 会议展开逻辑对齐 EWS**：不填写日期范围时，Graph 与 EWS 一样不展开循环实例（仅扫描主项/单次）；填写开始+结束日期后才使用 `calendarView` 在范围内展开 occurrence/exception。
+- **GOID 显示修正**：`MeetingGOID` 对齐为 `iCalUId`（与 EWS 报告一致）；同时最佳努力读取 GlobalObjectId（MAPI 扩展属性）并以更易读形式写入 Details。
+- **补齐字段**：Graph Meeting 报告补齐 `UserRole`（按 Organizer/Attendee 推断）与 `ResponseStatus`。
+- **循环规则更易读**：Graph 的 `recurrence.pattern` / `recurrence.range` 输出改为易读字符串（不再直接输出原始 JSON）。
+- **UI 提示更新**：提示文字改为“填写日期范围才展开循环实例”。
+
+## v1.5.4 (2025-12-14)
+- **Graph 会议循环展开**：Meeting 模式使用 `calendarView`（强制要求开始/结束日期），可在时间范围内扫描循环会议的 occurrence/exception。
+- **Graph 报告对齐 EWS**：Graph Meeting 报告字段对齐 EWS 报告格式，包含 Organizer/Attendees/Start/End/IsCancelled/ResponseStatus 等，并补充 `iCalUId`、`SeriesMasterId`。
+- **GOID 最佳努力**：Graph 尝试通过 MAPI 扩展属性读取 GlobalObjectId（若租户/权限/数据不可用则自动留空，仍可使用 `iCalUId` 追踪）。
+- **UI 提示增强**：会议模式下提示 Graph 必须填写日期范围；EWS 不填写日期范围则不展开循环实例。
+
+## v1.5.3 (2025-12-14)
+- **UI 更新**：
+  - **标题与版本一致性**：标题栏、关于窗口统一显示 v1.5.3。
+  - **关于窗口增强**：增加 GitHub 项目链接与头像显示（若缺少 Pillow 则自动降级为仅文本）。
+  - **EWS 标签优化**：EWS 配置区域统一显示为 "Exchange On-Premise"。
+  - **日期选择器增强**：
+    - 点击日期输入框空白处可直接打开日历。
+    - 日历支持年份/月分快速选择。
+    - 会议模式下，以另一侧已选日期为参考，超出前后两年的日期自动置灰不可选。
+
+## v1.5.2 (2025-12-14)
+- **Bug 修复**：
+  - **日志显示修复**：修复了重新显示日志区域时，日志目录链接被挤到日志窗口上方的问题。现在日志区域会正确地显示在链接栏上方。
+
+## v1.5.1 (2025-12-14)
+- **UI 体验优化**：
+  - **智能窗口缩放**：点击“隐藏日志”时，窗口会自动向上收缩，避免留下大片空白区域；点击“显示日志”时自动恢复高度。
+  - **布局微调**：确保日志目录和报告链接始终固定在窗口底部，不受日志区域折叠影响。
+
 ## v1.5.0 (2025-12-14)
 - **安全性增强**：
   - **双重确认机制**：在取消“仅报告”模式（即进入删除模式）时，以及点击“开始清理”时，增加了强制性的二次确认弹窗，防止误操作导致数据丢失。

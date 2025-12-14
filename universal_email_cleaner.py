@@ -14,6 +14,19 @@ import traceback
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
 import calendar
+import webbrowser
+import base64
+import io
+
+APP_VERSION = "v1.5.8"
+GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
+GITHUB_PROFILE_URL = "https://github.com/andylu1988"
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
 
 # DPI Awareness
 try:
@@ -58,26 +71,36 @@ except ImportError as e:
     IMPERSONATION = None
 
 class DateEntry(ttk.Frame):
-    def __init__(self, master, textvariable, **kwargs):
+    def __init__(self, master, textvariable, mode_var=None, other_date_var=None, **kwargs):
         super().__init__(master, **kwargs)
         self.variable = textvariable
+        self.mode_var = mode_var
+        self.other_date_var = other_date_var
         self.entry = ttk.Entry(self, textvariable=self.variable, width=15)
         self.entry.pack(side="left", fill="x", expand=True)
+        # Bind click event to open calendar
+        self.entry.bind("<Button-1>", lambda e: self.open_calendar())
+        
         self.btn = ttk.Button(self, text="📅", width=3, command=self.open_calendar)
         self.btn.pack(side="left", padx=(2, 0))
 
     def open_calendar(self):
-        top = tk.Toplevel(self)
-        top.title("选择日期")
-        top.geometry("250x250")
-        top.grab_set()
+        # Check if calendar is already open
+        if hasattr(self, 'top') and self.top.winfo_exists():
+            self.top.lift()
+            return
+
+        self.top = tk.Toplevel(self)
+        self.top.title("选择日期")
+        self.top.geometry("280x280")
+        self.top.grab_set()
         
         # Center popup
         x = self.winfo_rootx()
         y = self.winfo_rooty() + self.winfo_height()
-        top.geometry(f"+{x}+{y}")
+        self.top.geometry(f"+{x}+{y}")
 
-        cal_frame = ttk.Frame(top)
+        cal_frame = ttk.Frame(self.top)
         cal_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
         now = datetime.now()
@@ -87,24 +110,89 @@ class DateEntry(ttk.Frame):
                 current_date = datetime.strptime(self.variable.get(), "%Y-%m-%d")
         except:
             pass
+
+        # For Meeting mode, use the other side date as reference for the +/- 2 year selectable window
+        self._meeting_ref_date = None
+        if self.mode_var and self.mode_var.get() == "Meeting":
+            ref_raw = None
+            try:
+                if self.other_date_var and self.other_date_var.get():
+                    ref_raw = self.other_date_var.get()
+            except Exception:
+                ref_raw = None
+
+            if ref_raw:
+                try:
+                    self._meeting_ref_date = datetime.strptime(ref_raw, "%Y-%m-%d").date()
+                except Exception:
+                    self._meeting_ref_date = None
+
+            if self._meeting_ref_date is None:
+                try:
+                    if self.variable.get():
+                        self._meeting_ref_date = datetime.strptime(self.variable.get(), "%Y-%m-%d").date()
+                except Exception:
+                    self._meeting_ref_date = None
+
+            if self._meeting_ref_date is None:
+                self._meeting_ref_date = datetime.now().date()
         
         self.cal_year = tk.IntVar(value=current_date.year)
         self.cal_month = tk.IntVar(value=current_date.month)
         
-        # Header
+        # Header with Year/Month navigation + quick selectors
         header = ttk.Frame(cal_frame)
         header.pack(fill="x", pady=5)
         
+        # Nav
+        ttk.Button(header, text="<<", width=3, command=lambda: self.change_year(-1, cal_grid)).pack(side="left")
         ttk.Button(header, text="<", width=2, command=lambda: self.change_month(-1, cal_grid)).pack(side="left")
-        self.lbl_header = ttk.Label(header, text=f"{self.cal_year.get()}年 {self.cal_month.get()}月", anchor="center")
-        self.lbl_header.pack(side="left", fill="x", expand=True)
+
+        # Quick selectors
+        year_values = None
+        if self.mode_var and self.mode_var.get() == "Meeting" and getattr(self, "_meeting_ref_date", None):
+            y0 = self._meeting_ref_date.year
+            year_values = [str(y) for y in range(y0 - 2, y0 + 3)]
+        else:
+            y0 = current_date.year
+            year_values = [str(y) for y in range(y0 - 10, y0 + 11)]
+
+        self.year_cb = ttk.Combobox(header, values=year_values, width=6, state="readonly")
+        self.year_cb.set(str(self.cal_year.get()))
+        self.year_cb.pack(side="left", padx=(6, 2))
+
+        self.month_cb = ttk.Combobox(header, values=[f"{m:02d}" for m in range(1, 13)], width=4, state="readonly")
+        self.month_cb.set(f"{self.cal_month.get():02d}")
+        self.month_cb.pack(side="left", padx=(2, 6))
+
+        def _on_year_month_change(_evt=None):
+            try:
+                y = int(self.year_cb.get())
+                m = int(self.month_cb.get())
+            except Exception:
+                return
+            self.cal_year.set(y)
+            self.cal_month.set(m)
+            self.render_calendar(cal_grid, self.top)
+
+        self.year_cb.bind("<<ComboboxSelected>>", _on_year_month_change)
+        self.month_cb.bind("<<ComboboxSelected>>", _on_year_month_change)
+
         ttk.Button(header, text=">", width=2, command=lambda: self.change_month(1, cal_grid)).pack(side="left")
+        ttk.Button(header, text=">>", width=3, command=lambda: self.change_year(1, cal_grid)).pack(side="left")
 
         # Grid
         cal_grid = ttk.Frame(cal_frame)
         cal_grid.pack(fill="both", expand=True)
         
-        self.render_calendar(cal_grid, top)
+        self.render_calendar(cal_grid, self.top)
+
+    def change_year(self, delta, grid_frame):
+        y = self.cal_year.get() + delta
+        self.cal_year.set(y)
+        if hasattr(self, "year_cb"):
+            self.year_cb.set(str(y))
+        self.render_calendar(grid_frame, grid_frame.winfo_toplevel())
 
     def change_month(self, delta, grid_frame):
         m = self.cal_month.get() + delta
@@ -117,7 +205,10 @@ class DateEntry(ttk.Frame):
             y += 1
         self.cal_year.set(y)
         self.cal_month.set(m)
-        self.lbl_header.config(text=f"{y}年 {m}月")
+        if hasattr(self, "year_cb"):
+            self.year_cb.set(str(y))
+        if hasattr(self, "month_cb"):
+            self.month_cb.set(f"{m:02d}")
         self.render_calendar(grid_frame, grid_frame.winfo_toplevel())
 
     def render_calendar(self, frame, top):
@@ -129,10 +220,28 @@ class DateEntry(ttk.Frame):
             ttk.Label(frame, text=d, anchor="center").grid(row=0, column=i, sticky="nsew")
             
         cal = calendar.monthcalendar(self.cal_year.get(), self.cal_month.get())
+        
+        # Determine valid date range if in Meeting mode
+        min_date = None
+        max_date = None
+        if self.mode_var and self.mode_var.get() == "Meeting":
+            ref_d = getattr(self, "_meeting_ref_date", None) or datetime.now().date()
+            min_date = ref_d - timedelta(days=365*2)
+            max_date = ref_d + timedelta(days=365*2)
+
         for r, week in enumerate(cal):
             for c, day in enumerate(week):
                 if day != 0:
-                    btn = tk.Button(frame, text=str(day), relief="flat", 
+                    state = "normal"
+                    if min_date and max_date:
+                        try:
+                            current_d = datetime(self.cal_year.get(), self.cal_month.get(), day).date()
+                            if not (min_date <= current_d <= max_date):
+                                state = "disabled"
+                        except ValueError:
+                            pass
+
+                    btn = tk.Button(frame, text=str(day), relief="flat", state=state,
                                     command=lambda d=day: self.select_date(d, top))
                     btn.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
         
@@ -338,23 +447,187 @@ def is_endless_recurring(item_type, recurrence_obj):
     return "N/A"
 
 
+def _graph_weekday_cn(day):
+    mapping = {
+        'monday': '周一', 'tuesday': '周二', 'wednesday': '周三',
+        'thursday': '周四', 'friday': '周五', 'saturday': '周六', 'sunday': '周日'
+    }
+    if not day:
+        return ""
+    return mapping.get(str(day).lower(), str(day))
+
+
+def format_graph_recurrence_pattern(pattern):
+    """Return (pattern_name, pattern_details) as human-readable strings."""
+    if not isinstance(pattern, dict) or not pattern:
+        return "", ""
+
+    p_type = (pattern.get('type') or '').strip()
+    interval = pattern.get('interval')
+
+    type_cn = {
+        'daily': '按天',
+        'weekly': '按周',
+        'absolutemonthly': '按月(固定)',
+        'relativemonthly': '按月(相对)',
+        'absoluteyearly': '按年(固定)',
+        'relativeyearly': '按年(相对)',
+    }.get(p_type.lower(), p_type)
+
+    details = []
+    if interval:
+        details.append(f"间隔={interval}")
+
+    days = pattern.get('daysOfWeek') or []
+    if days:
+        days_cn = ",".join(_graph_weekday_cn(d) for d in days)
+        details.append(f"星期={days_cn}")
+
+    if pattern.get('dayOfMonth'):
+        details.append(f"日期={pattern.get('dayOfMonth')}日")
+
+    if pattern.get('month'):
+        details.append(f"月份={pattern.get('month')}月")
+
+    if pattern.get('index'):
+        idx_map = {
+            'first': '第一个', 'second': '第二个', 'third': '第三个', 'fourth': '第四个', 'last': '最后一个'
+        }
+        details.append(f"索引={idx_map.get(str(pattern.get('index')).lower(), pattern.get('index'))}")
+
+    details_str = ", ".join(details)
+    return type_cn, (f"{type_cn}: {details_str}" if details_str else type_cn)
+
+
+def format_graph_recurrence_range(rng):
+    """Return (duration_str, is_endless_str) as human-readable strings."""
+    if not isinstance(rng, dict) or not rng:
+        return "", ""
+
+    r_type = (rng.get('type') or '').strip().lower()
+    start_date = rng.get('startDate')
+    end_date = rng.get('endDate')
+    number = rng.get('numberOfOccurrences')
+    tz = rng.get('recurrenceTimeZone')
+
+    parts = []
+    if start_date:
+        parts.append(f"开始: {start_date}")
+
+    is_endless = ""
+    if r_type == 'noend':
+        parts.append("无限期")
+        is_endless = "True"
+    elif r_type == 'enddate':
+        if end_date:
+            parts.append(f"结束: {end_date}")
+        is_endless = "False"
+    elif r_type == 'numbered':
+        if number:
+            parts.append(f"共 {number} 次")
+        is_endless = "False"
+    else:
+        if end_date:
+            parts.append(f"结束: {end_date}")
+
+    if tz:
+        parts.append(f"时区: {tz}")
+
+    return "; ".join(parts), is_endless
+
+
+def decode_graph_goid_base64_to_hex(goid_b64):
+    """Graph MAPI Binary extended properties return base64; convert to hex for easier comparison."""
+    if not goid_b64:
+        return ""
+    try:
+        raw = base64.b64decode(goid_b64)
+        return raw.hex().upper()
+    except Exception:
+        return ""
+
+
+def redact_sensitive_headers(headers, save_authorization=False):
+    """Mask sensitive auth material before writing debug logs."""
+    if not isinstance(headers, dict) or not headers:
+        return {}
+
+    redacted = {}
+    for k, v in headers.items():
+        key_lower = (k or "").lower()
+        if key_lower == "authorization":
+            if save_authorization:
+                redacted[k] = v
+            else:
+                if isinstance(v, str) and v.lower().startswith("bearer "):
+                    redacted[k] = "Bearer ***"
+                else:
+                    redacted[k] = "***"
+        else:
+            redacted[k] = v
+    return redacted
+
+
+def format_graph_meeting_response_status(user_email, user_role, organizer_email, attendees, item_response_status):
+    """Organizer => attendee responses; Attendee => self responseStatus."""
+    role = (user_role or "").strip().lower()
+    user_email_l = (user_email or "").strip().lower()
+    organizer_email_l = (organizer_email or "").strip().lower()
+
+    if role == "organizer":
+        parts = []
+        for a in (attendees or []):
+            addr = ((a.get("emailAddress") or {}).get("address") or "").strip()
+            if not addr:
+                continue
+            addr_l = addr.lower()
+            if addr_l in (user_email_l, organizer_email_l):
+                continue
+            resp = ((a.get("status") or {}).get("response") or "").strip()
+            parts.append(f"{addr}:{resp}" if resp else f"{addr}:")
+        return ";".join(parts)
+
+    # attendee (or unknown): Graph event.responseStatus is the current user's status
+    return ((item_response_status or {}).get("response") or "").strip()
+
+
 class Logger:
     def __init__(self, log_area, log_dir):
         self.log_area = log_area
         self.log_dir = log_dir
-        self.level = "NORMAL" # NORMAL or ADVANCED
+        self.level = "NORMAL" # NORMAL / ADVANCED / EXPERT
         self.file_lock = threading.Lock()
 
-    def _get_log_file_path(self):
+    def _level_rank(self, level):
+        mapping = {"NORMAL": 0, "ADVANCED": 1, "EXPERT": 2}
+        return mapping.get((level or "").upper(), 0)
+
+    def _get_log_file_path(self, kind="app"):
         date_str = datetime.now().strftime("%Y-%m-%d")
+        if kind == "advanced":
+            return os.path.join(self.log_dir, f"app_advanced_{date_str}.log")
+        if kind == "expert":
+            return os.path.join(self.log_dir, f"app_expert_{date_str}.log")
         return os.path.join(self.log_dir, f"app_{date_str}.log")
 
+    def get_current_debug_log_path(self):
+        if self.level == "ADVANCED":
+            return self._get_log_file_path("advanced")
+        if self.level == "EXPERT":
+            return self._get_log_file_path("expert")
+        return ""
+
     def set_level(self, level):
-        self.level = level
+        # Accept GUI values: Normal/Advanced/Expert
+        val = (level or "NORMAL").upper()
+        if val in ("NORMAL", "ADVANCED", "EXPERT"):
+            self.level = val
+        else:
+            self.level = "NORMAL"
 
     def log(self, message, level="INFO", is_advanced=False):
         # If message is advanced but current level is NORMAL, skip
-        if is_advanced and self.level != "ADVANCED":
+        if is_advanced and self._level_rank(self.level) < self._level_rank("ADVANCED"):
             return
 
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -373,28 +646,42 @@ class Logger:
         
         # File Write
         try:
-            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(log_path, "a", encoding="utf-8") as f:
+                # Always write normal log
+                with open(self._get_log_file_path("app"), "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
-        except:
+
+                # Advanced/Expert go to their own debug logs (separate from normal)
+                if is_advanced:
+                    dbg_path = self.get_current_debug_log_path()
+                    if dbg_path:
+                        with open(dbg_path, "a", encoding="utf-8") as f:
+                            f.write(full_msg + "\n")
+        except Exception:
             pass
 
-    def log_to_file_only(self, message):
-        """Writes directly to file, skipping GUI. Useful for large debug dumps."""
+    def log_to_file_only(self, message, min_level="ADVANCED"):
+        """Writes directly to debug file (advanced/expert), skipping GUI."""
+        if self._level_rank(self.level) < self._level_rank(min_level):
+            return
+
+        dbg_path = self.get_current_debug_log_path()
+        if not dbg_path:
+            return
+
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] [DEBUG_DATA] {message}"
         try:
-            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(log_path, "a", encoding="utf-8") as f:
+                with open(dbg_path, "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
-        except:
+        except Exception:
             pass
 
 class EwsTraceAdapter(NoVerifyHTTPAdapter):
     logger = None
     log_responses = True  # Default to True, can be disabled for "Advanced" mode
+    response_log_path = None
     
     def send(self, request, *args, **kwargs):
         # Resolve stream argument - NTLM auth needs stream=True internally
@@ -442,9 +729,12 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
                     content = response.content 
                     
                     # Write immediately to file
-                    docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
-                    os.makedirs(docs_dir, exist_ok=True)
-                    log_path = os.path.join(docs_dir, "ews_getitem_responses.log")
+                    log_path = self.response_log_path
+                    if not log_path:
+                        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
+                        os.makedirs(docs_dir, exist_ok=True)
+                        date_str = datetime.now().strftime("%Y-%m-%d")
+                        log_path = os.path.join(docs_dir, f"ews_getitem_responses_expert_{date_str}.log")
                     
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n\n{'='*80}\n")
@@ -467,7 +757,7 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
 class UniversalEmailCleanerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("通用邮件清理工具 v1.5.0 (Graph API & EWS)")
+        self.root.title(f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)")
         self.root.geometry("1100x900")
         self.root.minsize(900, 700)
         
@@ -504,19 +794,55 @@ class UniversalEmailCleanerApp:
         # 日志配置子菜单
         log_menu = tk.Menu(tools_menu, tearoff=0)
         self.log_level_var = tk.StringVar(value="Normal") # Normal, Advanced, Expert
-        
-        def on_log_level_change():
+        self.graph_save_auth_token_var = tk.BooleanVar(value=False)
+
+        def on_log_level_change_request():
+            # Shared handler for Tools menu and main UI
             val = self.log_level_var.get()
             if val == "Expert":
                 confirm = messagebox.askyesno("警告", "日志排错专用，日志量会很大且包含敏感信息，慎选！\n\n确认开启专家模式吗？")
                 if not confirm:
                     self.log_level_var.set("Normal")
                     return
-            # Sync with UI combobox if it exists (it will be created later, so we bind variable)
-            
-        log_menu.add_radiobutton(label="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_change)
-        log_menu.add_radiobutton(label="高级 (Advanced - 仅记录 EWS 请求)", variable=self.log_level_var, value="Advanced", command=on_log_level_change)
-        log_menu.add_radiobutton(label="专家 (Expert - 记录 EWS 请求和响应)", variable=self.log_level_var, value="Expert", command=on_log_level_change)
+            # Update runtime logger immediately
+            try:
+                self.logger.set_level(self.log_level_var.get())
+            except Exception:
+                pass
+
+            # If leaving Expert, force auth token saving OFF to stay safe
+            if self.log_level_var.get() != "Expert":
+                try:
+                    self.graph_save_auth_token_var.set(False)
+                except Exception:
+                    pass
+
+        def on_graph_save_auth_toggle():
+            if not self.graph_save_auth_token_var.get():
+                return
+
+            if self.log_level_var.get() != "Expert":
+                messagebox.showwarning("提示", "该选项仅在 Expert 日志级别下生效。\n\n请先将日志级别切换为 Expert。")
+                self.graph_save_auth_token_var.set(False)
+                return
+
+            confirm = messagebox.askyesno(
+                "高风险警告",
+                "开启后会在 Expert 日志中保存 Authorization Token，存在敏感信息泄漏风险。\n\n确认开启吗？"
+            )
+            if not confirm:
+                self.graph_save_auth_token_var.set(False)
+        
+        log_menu.add_radiobutton(label="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_change_request)
+        log_menu.add_radiobutton(label="高级 (Advanced - 记录 Graph/EWS 请求)", variable=self.log_level_var, value="Advanced", command=on_log_level_change_request)
+        log_menu.add_radiobutton(label="专家 (Expert - 记录 Graph/EWS 请求和响应)", variable=self.log_level_var, value="Expert", command=on_log_level_change_request)
+
+        log_menu.add_separator()
+        log_menu.add_checkbutton(
+            label="Graph Expert 保存 Authorization Token (危险)",
+            variable=self.graph_save_auth_token_var,
+            command=on_graph_save_auth_toggle,
+        )
         
         tools_menu.add_cascade(label="日志配置 (Log Level)", menu=log_menu)
         menubar.add_cascade(label="工具 (Tools)", menu=tools_menu)
@@ -587,13 +913,32 @@ class UniversalEmailCleanerApp:
         
         self.log_visible = True
         def toggle_log():
+            current_height = self.root.winfo_height()
             if self.log_visible:
                 self.log_area.pack_forget()
                 self.btn_toggle_log.config(text="显示日志 (Show Log)")
+                
+                # Shrink window to avoid empty space
+                # Assuming log area is roughly 200px
+                new_height = max(600, current_height - 200)
+                self.root.geometry(f"{self.root.winfo_width()}x{new_height}")
+                
+                # Stop log frame from expanding
+                log_frame.pack_configure(expand=False)
+                
                 self.log_visible = False
             else:
-                self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
+                # Pack before link_frame to ensure it stays above links
+                self.log_area.pack(fill="both", expand=True, padx=5, pady=5, before=self.link_frame)
                 self.btn_toggle_log.config(text="隐藏日志 (Hide Log)")
+                
+                # Restore window height
+                new_height = current_height + 200
+                self.root.geometry(f"{self.root.winfo_width()}x{new_height}")
+                
+                # Allow log frame to expand
+                log_frame.pack_configure(expand=True)
+                
                 self.log_visible = True
                 
         self.btn_toggle_log = ttk.Button(log_toolbar, text="隐藏日志 (Hide Log)", command=toggle_log, width=20)
@@ -603,17 +948,18 @@ class UniversalEmailCleanerApp:
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
         
         self.logger = Logger(self.log_area, self.documents_dir)
+        self.logger.set_level(self.log_level_var.get())
 
         # Links
-        link_frame = ttk.Frame(log_frame)
-        link_frame.pack(fill="x", padx=5)
+        self.link_frame = ttk.Frame(log_frame)
+        self.link_frame.pack(fill="x", padx=5)
         
         log_dir = os.path.dirname(self.log_file_path)
-        self.log_link_lbl = tk.Label(link_frame, text=f"日志目录: {log_dir}", fg="blue", cursor="hand2")
+        self.log_link_lbl = tk.Label(self.link_frame, text=f"日志目录: {log_dir}", fg="blue", cursor="hand2")
         self.log_link_lbl.pack(side="left")
         self.log_link_lbl.bind("<Button-1>", lambda e: os.startfile(log_dir) if os.path.exists(log_dir) else None)
         
-        self.report_link_lbl = tk.Label(link_frame, text="", fg="blue", cursor="hand2")
+        self.report_link_lbl = tk.Label(self.link_frame, text="", fg="blue", cursor="hand2")
         self.report_link_lbl.pack(side="left", padx=20)
 
         # Build Tabs
@@ -667,7 +1013,70 @@ class UniversalEmailCleanerApp:
         txt.config(state='disabled')
 
     def show_about(self):
-        messagebox.showinfo("关于", "通用邮件清理工具 (Universal Email Cleaner) v1.4.0\n\n支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。")
+        about = tk.Toplevel(self.root)
+        about.title("关于")
+        about.resizable(False, False)
+        about.geometry("520x260")
+        about.transient(self.root)
+        about.grab_set()
+
+        outer = ttk.Frame(about, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+
+        avatar_lbl = ttk.Label(top)
+        avatar_lbl.pack(side="left", padx=(0, 12))
+
+        text_col = ttk.Frame(top)
+        text_col.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(text_col, text=f"通用邮件清理工具 (Universal Email Cleaner) {APP_VERSION}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(text_col, text="支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。", justify="left").pack(anchor="w", pady=(6, 8))
+
+        link = tk.Label(text_col, text=GITHUB_PROJECT_URL, fg="#1a73e8", cursor="hand2")
+        try:
+            link.configure(font=("Segoe UI", 10, "underline"))
+        except Exception:
+            pass
+        link.pack(anchor="w")
+        link.bind("<Button-1>", lambda _e: webbrowser.open(GITHUB_PROJECT_URL))
+
+        ttk.Label(text_col, text=f"GitHub: {GITHUB_PROFILE_URL}").pack(anchor="w", pady=(6, 0))
+
+        # Load avatar from avatar_b64.txt (preferred) and show it if Pillow is available
+        def _try_load_avatar_b64():
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(base_dir, "avatar_b64.txt"),
+            ]
+            if getattr(sys, 'frozen', False):
+                candidates.append(os.path.join(sys._MEIPASS, "avatar_b64.txt"))
+
+            for p in candidates:
+                try:
+                    if os.path.exists(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            return f.read().strip()
+                except Exception:
+                    continue
+            return None
+
+        avatar_b64 = _try_load_avatar_b64()
+        if avatar_b64 and Image is not None and ImageTk is not None:
+            try:
+                raw = base64.b64decode(avatar_b64)
+                img = Image.open(io.BytesIO(raw)).convert("RGBA")
+                img = img.resize((88, 88))
+                about._avatar_img = ImageTk.PhotoImage(img)
+                avatar_lbl.configure(image=about._avatar_img)
+            except Exception:
+                pass
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="关闭", command=about.destroy).pack(side="right")
 
     # --- Config Management ---
     def load_config(self):
@@ -733,7 +1142,7 @@ class UniversalEmailCleanerApp:
         ttk.Radiobutton(type_frame, text="Microsoft Graph API", variable=self.source_type_var, value="Graph", command=self.toggle_connection_ui).pack(side="left", padx=20, pady=10)
 
         # 2. EWS Configuration Frame
-        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange 2010-2019 / Online)")
+        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange On-Premise)")
         self.ews_frame.pack(fill="x", pady=5, ipady=5)
         
         ews_grid = ttk.Frame(self.ews_frame)
@@ -1132,14 +1541,22 @@ class UniversalEmailCleanerApp:
         ttk.Entry(self.filter_frame, textvariable=self.criteria_sender, width=30).grid(row=1, column=3, **grid_opts)
 
         ttk.Label(self.filter_frame, text="开始日期 (YYYY-MM-DD):").grid(row=2, column=0, **grid_opts)
-        DateEntry(self.filter_frame, textvariable=self.criteria_start_date).grid(row=2, column=1, **grid_opts)
+        self.start_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_start_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_end_date)
+        self.start_date_entry.grid(row=2, column=1, **grid_opts)
         
         ttk.Label(self.filter_frame, text="结束日期 (YYYY-MM-DD):").grid(row=2, column=2, **grid_opts)
-        DateEntry(self.filter_frame, textvariable=self.criteria_end_date).grid(row=2, column=3, **grid_opts)
+        self.end_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_end_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_start_date)
+        self.end_date_entry.grid(row=2, column=3, **grid_opts)
+
+        self.meeting_date_hint_label = ttk.Label(
+            self.filter_frame,
+            text="提示：会议不填写日期范围则不展开循环实例；填写开始+结束日期后，Graph/EWS 都会在该范围内展开循环会议 occurrence/exception。"
+        )
+        self.meeting_date_hint_label.grid(row=3, column=0, columnspan=4, padx=5, pady=(2, 0), sticky='w')
 
         self.lbl_body = ttk.Label(self.filter_frame, text="正文包含:")
-        self.lbl_body.grid(row=3, column=0, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80).grid(row=3, column=1, columnspan=3, **grid_opts)
+        self.lbl_body.grid(row=4, column=0, **grid_opts)
+        ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80).grid(row=4, column=1, columnspan=3, **grid_opts)
 
         self.update_ui_for_target() # Init state
 
@@ -1161,11 +1578,17 @@ class UniversalEmailCleanerApp:
         ttk.Label(opt_frame, text="| 日志级别:").pack(side="left", padx=5)
         
         def on_log_level_click():
+            # Delegate to shared handler from Tools menu
             val = self.log_level_var.get()
             if val == "Expert":
                 confirm = messagebox.askyesno("警告", "日志排错专用，日志量会很大且包含敏感信息，慎选！\n\n确认开启专家模式吗？")
                 if not confirm:
                     self.log_level_var.set("Normal")
+                    return
+            try:
+                self.logger.set_level(self.log_level_var.get())
+            except Exception:
+                pass
 
         ttk.Radiobutton(opt_frame, text="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_click).pack(side="left", padx=5)
         ttk.Radiobutton(opt_frame, text="高级 (Advanced)", variable=self.log_level_var, value="Advanced", command=on_log_level_click).pack(side="left", padx=5)
@@ -1183,11 +1606,15 @@ class UniversalEmailCleanerApp:
             self.lbl_subject.config(text="会议标题包含:")
             self.lbl_sender.config(text="组织者地址:")
             self.lbl_body.config(text="会议内容包含:")
+            if hasattr(self, 'meeting_date_hint_label'):
+                self.meeting_date_hint_label.grid()
         else:
             self.meeting_opt_frame.pack_forget()
             self.lbl_subject.config(text="邮件主题包含:")
             self.lbl_sender.config(text="发件人地址:")
             self.lbl_body.config(text="邮件正文包含:")
+            if hasattr(self, 'meeting_date_hint_label'):
+                self.meeting_date_hint_label.grid_remove()
 
     def start_cleanup_thread(self):
         if not self.csv_path_var.get():
@@ -1220,9 +1647,12 @@ class UniversalEmailCleanerApp:
                 return
 
         # Date Range Validation for Meetings
+        # - Graph/EWS: 不填日期范围 => 不展开循环实例
+        # - 填了开始+结束 => 允许展开，但限制跨度 <= 2 年
         if self.cleanup_target_var.get() == "Meeting":
             start_str = self._normalize_date_input(self.criteria_start_date.get())
             end_str = self._normalize_date_input(self.criteria_end_date.get())
+
             if start_str and end_str:
                 try:
                     s_dt = datetime.strptime(start_str, "%Y-%m-%d")
@@ -1230,7 +1660,7 @@ class UniversalEmailCleanerApp:
                     if (e_dt - s_dt).days > 730: # Approx 2 years
                         messagebox.showwarning("日期范围过大", "会议清理的时间跨度不能超过 2 年。")
                         return
-                except:
+                except Exception:
                     pass
 
         # Double Confirmation for Deletion
@@ -1368,35 +1798,63 @@ class UniversalEmailCleanerApp:
                             
         return self.run_powershell_script(script)
 
-    def process_single_user_graph(self, user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock):
+    def process_single_user_graph(self, user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
+                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None):
         self.log(f"--- 正在处理: {user} ---")
         try:
-            url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
-            
-            if target_type == "Email":
-                params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
+            req_headers = dict(headers)
+
+            # Meetings: prefer calendarView to expand recurrence into occurrence/exception within a date range
+            if target_type == "Meeting" and resource == "calendarView":
+                if not calendar_view_start or not calendar_view_end:
+                    raise Exception("Graph calendarView requires startDateTime and endDateTime")
+                url = f"{graph_endpoint}/v1.0/users/{user}/calendarView"
+                params = {
+                    "startDateTime": calendar_view_start,
+                    "endDateTime": calendar_view_end,
+                    "$top": 100,
+                    "$select": "id,subject,organizer,attendees,start,end,type,isCancelled,iCalUId,seriesMasterId,responseStatus,recurrence,bodyPreview",
+                    # Try to read GOID via MAPI extended property PidLidGlobalObjectId (PSETID_Meeting, Id 0x0003)
+                    "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
+                }
             else:
-                params = {"$top": 100, "$select": "id,subject,organizer,start,type,isCancelled,body"}
+                url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
+                if target_type == "Email":
+                    params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
+                else:
+                    params = {
+                        "$top": 100,
+                        "$select": "id,subject,organizer,attendees,start,end,type,isCancelled,iCalUId,seriesMasterId,responseStatus,recurrence,bodyPreview",
+                        "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
+                    }
 
             if filter_str: params["$filter"] = filter_str
             
             if body_keyword:
                 params["$search"] = f'"body:{body_keyword}"'
-                headers["ConsistencyLevel"] = "eventual"
+                req_headers["ConsistencyLevel"] = "eventual"
             
             while url:
-                if self.log_level_var.get() == "Advanced":
+                graph_log_level = self.log_level_var.get()
+                if graph_log_level in ("Advanced", "Expert"):
+                    save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
                     self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
-                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
-                    if params: self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
+                    if params:
+                        self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
 
                 self.log(f"请求: GET {url} | 参数: {params}", is_advanced=True)
-                resp = requests.get(url, headers=headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
+                resp = requests.get(url, headers=req_headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
                 
-                if self.log_level_var.get() == "Advanced":
+                if graph_log_level in ("Advanced", "Expert"):
                     self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
                     self.logger.log_to_file_only(f"HEADERS: {json.dumps(dict(resp.headers), default=str)}")
-                    self.logger.log_to_file_only(f"BODY: {resp.text}")
+                    body_text = resp.text or ""
+                    if graph_log_level == "Advanced":
+                        body_text = body_text[:4096]
+                    else:
+                        body_text = body_text[:50000]
+                    self.logger.log_to_file_only(f"BODY: {body_text}")
                 
                 if resp.status_code != 200:
                     self.log(f"  X 查询失败: {resp.text}", "ERROR")
@@ -1429,40 +1887,162 @@ class UniversalEmailCleanerApp:
                             item_type = "Email"
                         else:
                             sender = item.get('organizer', {}).get('emailAddress', {}).get('address', '未知')
-                            time_val = item.get('start', {}).get('dateTime')
+                            start_val = item.get('start', {}).get('dateTime')
+                            end_val = item.get('end', {}).get('dateTime')
                             item_type = item.get('type', 'Event')
-                            if item.get('isCancelled'): item_type += " (Cancelled)"
 
-                        row_data = {
-                            'UserPrincipalName': user,
-                            'ItemId': item_id,
-                            'Subject': subject,
-                            'Sender/Organizer': sender,
-                            'Time': time_val,
-                            'Type': item_type,
-                            'Action': 'ReportOnly' if report_only else 'Delete',
-                            'Status': 'Pending',
-                            'Details': ''
-                        }
+                            attendees = item.get('attendees', []) or []
+                            attendee_emails = []
+                            for a in attendees:
+                                addr = (a.get('emailAddress') or {}).get('address')
+                                if addr:
+                                    attendee_emails.append(addr)
+                            is_cancelled = bool(item.get('isCancelled'))
+                            ical_uid = item.get('iCalUId', '')
+                            series_master_id = item.get('seriesMasterId', '')
+
+                            goid_b64 = ''
+                            try:
+                                props = item.get('singleValueExtendedProperties') or []
+                                if props:
+                                    # Graph returns base64 for Binary extended properties
+                                    goid_b64 = props[0].get('value', '') or ''
+                            except Exception:
+                                goid_b64 = ''
+
+                            goid_hex = decode_graph_goid_base64_to_hex(goid_b64)
+
+                            user_role = 'Attendee'
+                            try:
+                                if sender and user and sender.strip().lower() == user.strip().lower():
+                                    user_role = 'Organizer'
+                            except Exception:
+                                pass
+
+                            response_status = format_graph_meeting_response_status(
+                                user_email=user,
+                                user_role=user_role,
+                                organizer_email=sender,
+                                attendees=attendees,
+                                item_response_status=(item.get('responseStatus') or {}),
+                            )
+
+                            # Align with EWS: MeetingGOID uses iCalUId (same semantic as item.uid in EWS)
+                            meeting_goid = ical_uid or ''
+                            clean_goid = (meeting_goid or item_id).strip().lower()
+
+                            details_hint = ''
+                            if goid_b64 or goid_hex:
+                                details_hint = f"GOID(b64)={goid_b64}; GOID(hex)={goid_hex}".strip('; ')
+
+                            row_data = {
+                                'UserPrincipalName': user,
+                                'Subject': subject,
+                                'Type': item_type,
+                                'MeetingGOID': meeting_goid,
+                                'CleanGOID': clean_goid,
+                                'iCalUId': ical_uid,
+                                'SeriesMasterId': series_master_id,
+                                'Organizer': sender,
+                                'Attendees': ';'.join(attendee_emails),
+                                'Start': start_val,
+                                'End': end_val,
+                                'UserRole': user_role,
+                                'IsCancelled': is_cancelled,
+                                'ResponseStatus': response_status,
+                                'RecurrencePattern': '',
+                                'PatternDetails': '',
+                                'RecurrenceDuration': '',
+                                'IsEndless': '',
+                                'Action': 'ReportOnly' if report_only else 'Delete',
+                                'Status': 'Pending',
+                                'Details': details_hint
+                            }
+
+                            if is_cancelled:
+                                row_data['Type'] = f"{row_data['Type']} (Cancelled)"
+
+                            # If current item already has recurrence (usually seriesMaster), format it.
+                            try:
+                                if item.get('recurrence'):
+                                    rec = item.get('recurrence') or {}
+                                    p_name, p_details = format_graph_recurrence_pattern(rec.get('pattern') or {})
+                                    dur, endless = format_graph_recurrence_range(rec.get('range') or {})
+                                    row_data['RecurrencePattern'] = p_name
+                                    row_data['PatternDetails'] = p_details
+                                    row_data['RecurrenceDuration'] = dur
+                                    row_data['IsEndless'] = endless
+                            except Exception:
+                                pass
+
+                            # Best-effort: if this is an occurrence/exception and has seriesMasterId,
+                            # pull recurrence from master (cache per user) to align with EWS report.
+                            try:
+                                if (item_type in ('occurrence', 'exception') or 'occurrence' in str(item_type).lower() or 'exception' in str(item_type).lower()) and series_master_id:
+                                    if not hasattr(self, '_graph_master_cache'):
+                                        self._graph_master_cache = {}
+                                    user_cache = self._graph_master_cache.setdefault(user, {})
+                                    if series_master_id not in user_cache:
+                                        master_url = f"{graph_endpoint}/v1.0/users/{user}/events/{series_master_id}"
+                                        master_params = {
+                                            "$select": "id,type,recurrence,iCalUId",
+                                        }
+                                        m_resp = requests.get(master_url, headers=req_headers, params=master_params)
+                                        if m_resp.status_code == 200:
+                                            user_cache[series_master_id] = m_resp.json()
+                                        else:
+                                            user_cache[series_master_id] = None
+                                    master_obj = user_cache.get(series_master_id)
+                                    if master_obj and master_obj.get('recurrence'):
+                                        rec = master_obj.get('recurrence')
+                                        pattern = (rec.get('pattern') or {})
+                                        rng = (rec.get('range') or {})
+                                        p_name, p_details = format_graph_recurrence_pattern(pattern)
+                                        dur, endless = format_graph_recurrence_range(rng)
+                                        row_data['RecurrencePattern'] = p_name
+                                        row_data['PatternDetails'] = p_details
+                                        row_data['RecurrenceDuration'] = dur
+                                        row_data['IsEndless'] = endless
+                            except Exception:
+                                pass
+
+                        if target_type == "Email":
+                            row_data = {
+                                'UserPrincipalName': user,
+                                'ItemId': item_id,
+                                'Subject': subject,
+                                'Sender/Organizer': sender,
+                                'Time': time_val,
+                                'Type': item_type,
+                                'Action': 'ReportOnly' if report_only else 'Delete',
+                                'Status': 'Pending',
+                                'Details': ''
+                            }
 
                         if report_only:
                             self.log(f"  [报告] 发现: {subject} ({item_type})")
                             row_data['Status'] = 'Skipped'
-                            row_data['Details'] = '仅报告模式'
+                            row_data['Details'] = ((row_data.get('Details') + '; ') if row_data.get('Details') else '') + '仅报告模式'
                         else:
                             self.log(f"  正在删除: {subject}")
-                            del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
+                            del_url = f"{graph_endpoint}/v1.0/users/{user}/{delete_resource}/{item_id}"
                             
-                            if self.log_level_var.get() == "Advanced":
+                            if graph_log_level in ("Advanced", "Expert"):
+                                save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
                                 self.logger.log_to_file_only(f"GRAPH REQ: DELETE {del_url}")
-                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(headers, default=str)}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
 
                             self.log(f"请求: DELETE {del_url}", is_advanced=True)
-                            del_resp = requests.delete(del_url, headers=headers)
+                            del_resp = requests.delete(del_url, headers=req_headers)
                             
-                            if self.log_level_var.get() == "Advanced":
+                            if graph_log_level in ("Advanced", "Expert"):
                                 self.logger.log_to_file_only(f"GRAPH RESP: {del_resp.status_code}")
-                                self.logger.log_to_file_only(f"BODY: {del_resp.text}")
+                                body_text = del_resp.text or ""
+                                if graph_log_level == "Advanced":
+                                    body_text = body_text[:4096]
+                                else:
+                                    body_text = body_text[:50000]
+                                self.logger.log_to_file_only(f"BODY: {body_text}")
                             
                             if del_resp.status_code == 204:
                                 self.log("    √ 已删除")
@@ -1471,7 +2051,8 @@ class UniversalEmailCleanerApp:
                                 self.log(f"    X 删除失败: {del_resp.status_code}", "ERROR")
                                 self.log(f"响应: {del_resp.text}", is_advanced=True)
                                 row_data['Status'] = 'Failed'
-                                row_data['Details'] = f"状态码: {del_resp.status_code}"
+                                err_detail = f"状态码: {del_resp.status_code}"
+                                row_data['Details'] = ((row_data.get('Details') + '; ') if row_data.get('Details') else '') + err_detail
                         
                         with csv_lock:
                             writer.writerow(row_data)
@@ -1530,7 +2111,16 @@ class UniversalEmailCleanerApp:
             target_type = self.cleanup_target_var.get()
             
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
-                fieldnames = ['UserPrincipalName', 'ItemId', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
+                if target_type == "Meeting":
+                    fieldnames = [
+                        'UserPrincipalName', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
+                        'iCalUId', 'SeriesMasterId',
+                        'Organizer', 'Attendees', 'Start', 'End', 'UserRole',
+                        'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
+                        'Action', 'Status', 'Details'
+                    ]
+                else:
+                    fieldnames = ['UserPrincipalName', 'ItemId', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
 
@@ -1546,15 +2136,29 @@ class UniversalEmailCleanerApp:
                 # Target Specific Logic
                 if target_type == "Email":
                     resource = "messages"
+                    delete_resource = "messages"
                     if self.criteria_msg_id.get(): filters.append(f"internetMessageId eq '{self.criteria_msg_id.get()}'")
                     if self.criteria_sender.get(): filters.append(f"from/emailAddress/address eq '{self.criteria_sender.get()}'")
                     if start_date: filters.append(f"receivedDateTime ge {start_date}T00:00:00Z")
                     if end_date: filters.append(f"receivedDateTime le {end_date}T23:59:59Z")
                 else: # Meeting
-                    resource = "events" # or calendar/events
-                    if self.criteria_sender.get(): filters.append(f"organizer/emailAddress/address eq '{self.criteria_sender.get()}'")
-                    if start_date: filters.append(f"start/dateTime ge '{start_date}T00:00:00'")
-                    if end_date: filters.append(f"end/dateTime le '{end_date}T23:59:59'")
+                    # If both start+end present -> use calendarView to expand recurrence instances
+                    # Otherwise -> fallback to events (no recurrence expansion)
+                    if start_date and end_date:
+                        resource = "calendarView"
+                        delete_resource = "events"
+                    else:
+                        resource = "events"
+                        delete_resource = "events"
+
+                    if self.criteria_sender.get():
+                        filters.append(f"organizer/emailAddress/address eq '{self.criteria_sender.get()}'")
+
+                    if resource == "events":
+                        if start_date:
+                            filters.append(f"start/dateTime ge '{start_date}T00:00:00'")
+                        if end_date:
+                            filters.append(f"end/dateTime le '{end_date}T23:59:59'")
                     
                     # Meeting Specifics
                     if self.meeting_only_cancelled_var.get():
@@ -1564,11 +2168,22 @@ class UniversalEmailCleanerApp:
                     if "Single" in scope:
                         filters.append("type eq 'singleInstance'")
                     elif "Series" in scope:
-                        filters.append("type eq 'seriesMaster'")
+                        if resource == "calendarView":
+                            # Include expanded instances too (occurrence/exception) for EWS-like scan
+                            filters.append("type eq 'seriesMaster' or type eq 'occurrence' or type eq 'exception'")
+                        else:
+                            filters.append("type eq 'seriesMaster'")
                     # If All, no type filter
 
                 filter_str = " and ".join(filters)
                 body_keyword = self.criteria_body.get()
+
+                calendar_view_start = None
+                calendar_view_end = None
+                if target_type == "Meeting" and resource == "calendarView":
+                    # Use UTC ISO; calendarView requires both
+                    calendar_view_start = f"{start_date}T00:00:00Z"
+                    calendar_view_end = f"{end_date}T23:59:59Z"
 
                 csv_lock = threading.Lock()
                 report_only = self.report_only_var.get()
@@ -1578,7 +2193,8 @@ class UniversalEmailCleanerApp:
                     for user in users:
                         futures.append(executor.submit(
                             self.process_single_user_graph, 
-                            user, graph_endpoint, headers, resource, target_type, filter_str, body_keyword, report_only, writer, csv_lock
+                            user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
+                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end
                         ))
                     
                     # Wait for all to complete
@@ -1942,14 +2558,18 @@ class UniversalEmailCleanerApp:
             messagebox.showerror("错误", f"无法加载 EWS 模块 (exchangelib)。\n错误信息: {EXCHANGELIB_ERROR}")
             return
 
-        # Configure Advanced Logging for EWS
+        # Configure Advanced/Expert Logging for EWS
         ews_log_handlers = []
         log_level = self.log_level_var.get()
         
         if log_level in ("Advanced", "Expert"):
             try:
                 # Create Handler
-                file_handler = logging.FileHandler(self.log_file_path, encoding='utf-8')
+                # Route EWS trace into level-specific debug log file
+                debug_path = self.logger.get_current_debug_log_path() if self.logger else None
+                if not debug_path:
+                    debug_path = os.path.join(self.documents_dir, "app_advanced_fallback.log")
+                file_handler = logging.FileHandler(debug_path, encoding='utf-8')
                 # We use a simple formatter because the TraceAdapter handles the XML formatting
                 file_handler.setFormatter(logging.Formatter('%(message)s')) 
                 ews_log_handlers.append(file_handler)
@@ -1962,14 +2582,17 @@ class UniversalEmailCleanerApp:
                 # Inject Adapter
                 EwsTraceAdapter.logger = trace_logger
                 EwsTraceAdapter.log_responses = (log_level == "Expert")
+                if log_level == "Expert":
+                    date_str = datetime.now().strftime("%Y-%m-%d")
+                    EwsTraceAdapter.response_log_path = os.path.join(self.documents_dir, f"ews_getitem_responses_expert_{date_str}.log")
+                else:
+                    EwsTraceAdapter.response_log_path = None
                 BaseProtocol.HTTP_ADAPTER_CLS = EwsTraceAdapter
                 
                 # Check permission for response log if Expert
                 if log_level == "Expert":
                     try:
-                        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
-                        os.makedirs(docs_dir, exist_ok=True)
-                        test_path = os.path.join(docs_dir, "ews_getitem_responses.log")
+                        test_path = EwsTraceAdapter.response_log_path
                         with open(test_path, "a", encoding="utf-8") as f:
                             pass
                         self.log(f"EWS 响应日志将写入: {test_path}", is_advanced=True)
@@ -2091,6 +2714,7 @@ class UniversalEmailCleanerApp:
             # Reset Adapter
             BaseProtocol.HTTP_ADAPTER_CLS = NoVerifyHTTPAdapter
             EwsTraceAdapter.logger = None
+            EwsTraceAdapter.response_log_path = None
 
 if __name__ == "__main__":
     root = tk.Tk()
