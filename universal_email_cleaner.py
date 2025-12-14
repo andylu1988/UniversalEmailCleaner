@@ -602,7 +602,8 @@ class UniversalEmailCleanerApp:
                 
                 self.log_visible = False
             else:
-                self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
+                # Pack before link_frame to ensure it stays above links
+                self.log_area.pack(fill="both", expand=True, padx=5, pady=5, before=self.link_frame)
                 self.btn_toggle_log.config(text="隐藏日志 (Hide Log)")
                 
                 # Restore window height
@@ -623,15 +624,15 @@ class UniversalEmailCleanerApp:
         self.logger = Logger(self.log_area, self.documents_dir)
 
         # Links
-        link_frame = ttk.Frame(log_frame)
-        link_frame.pack(fill="x", padx=5)
+        self.link_frame = ttk.Frame(log_frame)
+        self.link_frame.pack(fill="x", padx=5)
         
         log_dir = os.path.dirname(self.log_file_path)
-        self.log_link_lbl = tk.Label(link_frame, text=f"日志目录: {log_dir}", fg="blue", cursor="hand2")
+        self.log_link_lbl = tk.Label(self.link_frame, text=f"日志目录: {log_dir}", fg="blue", cursor="hand2")
         self.log_link_lbl.pack(side="left")
         self.log_link_lbl.bind("<Button-1>", lambda e: os.startfile(log_dir) if os.path.exists(log_dir) else None)
         
-        self.report_link_lbl = tk.Label(link_frame, text="", fg="blue", cursor="hand2")
+        self.report_link_lbl = tk.Label(self.link_frame, text="", fg="blue", cursor="hand2")
         self.report_link_lbl.pack(side="left", padx=20)
 
         # Build Tabs
