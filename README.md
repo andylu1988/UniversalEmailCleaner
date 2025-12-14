@@ -58,6 +58,38 @@ A powerful, user-friendly GUI tool designed to help administrators and users cle
 
 4.  **Run**: Click "Start Cleanup" to begin processing.
 
+## Logging & Diagnostics
+
+Logs and reports are written to your Documents folder:
+
+- Log/report base directory: `%USERPROFILE%\Documents\UniversalEmailCleaner`
+- Reports: `%USERPROFILE%\Documents\UniversalEmailCleaner\Reports`
+
+The app supports three log levels (Tools → Log Level, also synced with the main UI):
+
+- **Normal**: Standard operational logs.
+- **Advanced**: Adds detailed Graph/EWS request diagnostics.
+- **Expert**: Adds more verbose diagnostics; shows a warning prompt before enabling.
+
+In Advanced/Expert mode, extra debug logs are written to separate daily files:
+
+- `app_advanced_YYYY-MM-DD.log`
+- `app_expert_YYYY-MM-DD.log`
+
+EWS Expert mode also writes GetItem responses to:
+
+- `ews_getitem_responses_expert_YYYY-MM-DD.log`
+
+### Graph Authorization token logging (Expert only)
+
+By default, Graph `Authorization` headers are masked in logs (`Bearer ***`).
+
+If you must capture the token for troubleshooting, you can enable the dangerous option:
+
+- Tools → Log Level → **“Graph Expert 保存 Authorization Token (危险)”**
+
+This option is **OFF by default**, only effective in **Expert**, and will prompt for confirmation.
+
 ## License
 
 MIT License

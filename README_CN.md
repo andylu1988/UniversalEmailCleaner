@@ -60,6 +60,38 @@
 
 4.  **执行**：点击“开始清理”按钮开始处理。
 
+## 日志与排错 (Logging & Diagnostics)
+
+日志与报告默认写入：
+
+- 根目录：`%USERPROFILE%\Documents\UniversalEmailCleaner`
+- 报告目录：`%USERPROFILE%\Documents\UniversalEmailCleaner\Reports`
+
+支持三种日志级别（Tools → 日志配置，且与主界面联动）：
+
+- **默认 (Normal)**：常规操作日志。
+- **高级 (Advanced)**：额外记录 Graph/EWS 请求排错信息。
+- **专家 (Expert)**：记录更完整的排错信息；开启时会弹出安全警告确认。
+
+在高级/专家模式下，额外排错日志会分开写入按日滚动文件：
+
+- `app_advanced_YYYY-MM-DD.log`
+- `app_expert_YYYY-MM-DD.log`
+
+EWS 在专家模式下还会额外记录 GetItem 响应到：
+
+- `ews_getitem_responses_expert_YYYY-MM-DD.log`
+
+### Graph Authorization Token 记录（仅 Expert）
+
+默认情况下，Graph 的 `Authorization` 会在日志中打码（`Bearer ***`），避免 Token 泄漏。
+
+如确有排错需要，可在 Expert 下开启高风险选项：
+
+- Tools → 日志配置 → **Graph Expert 保存 Authorization Token (危险)**
+
+该选项默认关闭，仅在 Expert 级别生效，开启时会二次确认；离开 Expert 会自动关闭。
+
 ## 许可证
 
 MIT License
