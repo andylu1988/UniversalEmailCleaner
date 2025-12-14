@@ -587,13 +587,31 @@ class UniversalEmailCleanerApp:
         
         self.log_visible = True
         def toggle_log():
+            current_height = self.root.winfo_height()
             if self.log_visible:
                 self.log_area.pack_forget()
                 self.btn_toggle_log.config(text="显示日志 (Show Log)")
+                
+                # Shrink window to avoid empty space
+                # Assuming log area is roughly 200px
+                new_height = max(600, current_height - 200)
+                self.root.geometry(f"{self.root.winfo_width()}x{new_height}")
+                
+                # Stop log frame from expanding
+                log_frame.pack_configure(expand=False)
+                
                 self.log_visible = False
             else:
                 self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
                 self.btn_toggle_log.config(text="隐藏日志 (Hide Log)")
+                
+                # Restore window height
+                new_height = current_height + 200
+                self.root.geometry(f"{self.root.winfo_width()}x{new_height}")
+                
+                # Allow log frame to expand
+                log_frame.pack_configure(expand=True)
+                
                 self.log_visible = True
                 
         self.btn_toggle_log = ttk.Button(log_toolbar, text="隐藏日志 (Hide Log)", command=toggle_log, width=20)
