@@ -13,6 +13,7 @@ import logging
 import traceback
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
+import calendar
 
 # DPI Awareness
 try:
@@ -55,6 +56,93 @@ except ImportError as e:
     class CalendarItem: pass
     DELEGATE = None
     IMPERSONATION = None
+
+class DateEntry(ttk.Frame):
+    def __init__(self, master, textvariable, **kwargs):
+        super().__init__(master, **kwargs)
+        self.variable = textvariable
+        self.entry = ttk.Entry(self, textvariable=self.variable, width=15)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.btn = ttk.Button(self, text="📅", width=3, command=self.open_calendar)
+        self.btn.pack(side="left", padx=(2, 0))
+
+    def open_calendar(self):
+        top = tk.Toplevel(self)
+        top.title("选择日期")
+        top.geometry("250x250")
+        top.grab_set()
+        
+        # Center popup
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        top.geometry(f"+{x}+{y}")
+
+        cal_frame = ttk.Frame(top)
+        cal_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        now = datetime.now()
+        current_date = now
+        try:
+            if self.variable.get():
+                current_date = datetime.strptime(self.variable.get(), "%Y-%m-%d")
+        except:
+            pass
+        
+        self.cal_year = tk.IntVar(value=current_date.year)
+        self.cal_month = tk.IntVar(value=current_date.month)
+        
+        # Header
+        header = ttk.Frame(cal_frame)
+        header.pack(fill="x", pady=5)
+        
+        ttk.Button(header, text="<", width=2, command=lambda: self.change_month(-1, cal_grid)).pack(side="left")
+        self.lbl_header = ttk.Label(header, text=f"{self.cal_year.get()}年 {self.cal_month.get()}月", anchor="center")
+        self.lbl_header.pack(side="left", fill="x", expand=True)
+        ttk.Button(header, text=">", width=2, command=lambda: self.change_month(1, cal_grid)).pack(side="left")
+
+        # Grid
+        cal_grid = ttk.Frame(cal_frame)
+        cal_grid.pack(fill="both", expand=True)
+        
+        self.render_calendar(cal_grid, top)
+
+    def change_month(self, delta, grid_frame):
+        m = self.cal_month.get() + delta
+        y = self.cal_year.get()
+        if m < 1:
+            m = 12
+            y -= 1
+        elif m > 12:
+            m = 1
+            y += 1
+        self.cal_year.set(y)
+        self.cal_month.set(m)
+        self.lbl_header.config(text=f"{y}年 {m}月")
+        self.render_calendar(grid_frame, grid_frame.winfo_toplevel())
+
+    def render_calendar(self, frame, top):
+        for widget in frame.winfo_children():
+            widget.destroy()
+            
+        days = ["一", "二", "三", "四", "五", "六", "日"]
+        for i, d in enumerate(days):
+            ttk.Label(frame, text=d, anchor="center").grid(row=0, column=i, sticky="nsew")
+            
+        cal = calendar.monthcalendar(self.cal_year.get(), self.cal_month.get())
+        for r, week in enumerate(cal):
+            for c, day in enumerate(week):
+                if day != 0:
+                    btn = tk.Button(frame, text=str(day), relief="flat", 
+                                    command=lambda d=day: self.select_date(d, top))
+                    btn.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
+        
+        for i in range(7):
+            frame.columnconfigure(i, weight=1)
+
+    def select_date(self, day, top):
+        date_str = f"{self.cal_year.get()}-{self.cal_month.get():02d}-{day:02d}"
+        self.variable.set(date_str)
+        top.destroy()
 
 
 def guess_calendar_item_type(item):
@@ -251,11 +339,15 @@ def is_endless_recurring(item_type, recurrence_obj):
 
 
 class Logger:
-    def __init__(self, log_area, log_file_path):
+    def __init__(self, log_area, log_dir):
         self.log_area = log_area
-        self.log_file_path = log_file_path
+        self.log_dir = log_dir
         self.level = "NORMAL" # NORMAL or ADVANCED
         self.file_lock = threading.Lock()
+
+    def _get_log_file_path(self):
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        return os.path.join(self.log_dir, f"app_{date_str}.log")
 
     def set_level(self, level):
         self.level = level
@@ -281,8 +373,9 @@ class Logger:
         
         # File Write
         try:
+            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                with open(log_path, "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
         except:
             pass
@@ -292,8 +385,9 @@ class Logger:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] [DEBUG_DATA] {message}"
         try:
+            log_path = self._get_log_file_path()
             with self.file_lock:
-                with open(self.log_file_path, "a", encoding="utf-8") as f:
+                with open(log_path, "a", encoding="utf-8") as f:
                     f.write(full_msg + "\n")
         except:
             pass
@@ -373,7 +467,7 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
 class UniversalEmailCleanerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("通用邮件清理工具 (Graph API & EWS)")
+        self.root.title("通用邮件清理工具 v1.5.0 (Graph API & EWS)")
         self.root.geometry("1100x900")
         self.root.minsize(900, 700)
         
@@ -403,6 +497,10 @@ class UniversalEmailCleanerApp:
         # 工具菜单
         tools_menu = tk.Menu(menubar, tearoff=0)
         
+        # EWS Autodiscover Menu
+        tools_menu.add_command(label="使用自动发现刷新 EWS 配置 (Refresh EWS Config)", command=self.refresh_ews_config)
+        tools_menu.add_separator()
+
         # 日志配置子菜单
         log_menu = tk.Menu(tools_menu, tearoff=0)
         self.log_level_var = tk.StringVar(value="Normal") # Normal, Advanced, Expert
@@ -483,15 +581,38 @@ class UniversalEmailCleanerApp:
         log_frame = ttk.LabelFrame(main_frame, text="运行日志")
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
         
+        # Log Toolbar
+        log_toolbar = ttk.Frame(log_frame)
+        log_toolbar.pack(fill="x", padx=5, pady=2)
+        
+        self.log_visible = True
+        def toggle_log():
+            if self.log_visible:
+                self.log_area.pack_forget()
+                self.btn_toggle_log.config(text="显示日志 (Show Log)")
+                self.log_visible = False
+            else:
+                self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
+                self.btn_toggle_log.config(text="隐藏日志 (Hide Log)")
+                self.log_visible = True
+                
+        self.btn_toggle_log = ttk.Button(log_toolbar, text="隐藏日志 (Hide Log)", command=toggle_log, width=20)
+        self.btn_toggle_log.pack(side="right")
+
         self.log_area = scrolledtext.ScrolledText(log_frame, height=12, state='disabled', font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
         
-        self.logger = Logger(self.log_area, self.log_file_path)
+        self.logger = Logger(self.log_area, self.documents_dir)
 
         # Links
         link_frame = ttk.Frame(log_frame)
         link_frame.pack(fill="x", padx=5)
-        tk.Label(link_frame, text=f"日志文件: {self.log_file_path}", fg="blue", cursor="hand2").pack(side="left")
+        
+        log_dir = os.path.dirname(self.log_file_path)
+        self.log_link_lbl = tk.Label(link_frame, text=f"日志目录: {log_dir}", fg="blue", cursor="hand2")
+        self.log_link_lbl.pack(side="left")
+        self.log_link_lbl.bind("<Button-1>", lambda e: os.startfile(log_dir) if os.path.exists(log_dir) else None)
+        
         self.report_link_lbl = tk.Label(link_frame, text="", fg="blue", cursor="hand2")
         self.report_link_lbl.pack(side="left", padx=20)
 
@@ -500,6 +621,17 @@ class UniversalEmailCleanerApp:
         self.build_cleanup_tab()
 
         self.load_config()
+        
+        # Ensure UI state matches config
+        self.toggle_connection_ui()
+
+    def refresh_ews_config(self):
+        if not self.ews_user_var.get() or not self.ews_pass_var.get():
+            messagebox.showwarning("提示", "请先在连接配置中填写 EWS 管理员账号和密码。")
+            return
+        
+        self.ews_use_autodiscover.set(True)
+        self.test_ews_connection()
 
     def log(self, msg, level="INFO", is_advanced=False):
         self.logger.log(msg, level, is_advanced)
@@ -556,11 +688,15 @@ class UniversalEmailCleanerApp:
                     self.ews_use_autodiscover.set(config.get('ews_autodiscover', True))
                     self.ews_auth_type_var.set(config.get('ews_auth_type', 'Impersonation'))
                     # Common
-                    self.source_type_var.set(config.get('source_type', 'Graph'))
+                    self.source_type_var.set(config.get('source_type', 'EWS')) # Default to EWS if not set
                     self.csv_path_var.set(config.get('csv_path', ''))
                     self.log(">>> 配置已加载。")
             except Exception as e:
                 self.log(f"X 加载配置失败: {e}", "ERROR")
+        else:
+            # No config file, set default to EWS
+            self.source_type_var.set("EWS")
+            self.toggle_connection_ui()
 
     def save_config(self):
         config = {
@@ -931,6 +1067,10 @@ class UniversalEmailCleanerApp:
             if use_auto:
                 self.log("Using Autodiscover...")
                 account = Account(primary_smtp_address=user, credentials=credentials, autodiscover=True)
+                # Update server var if successful
+                if account.protocol.service_endpoint:
+                    self.ews_server_var.set(account.protocol.service_endpoint)
+                    self.log(f"Autodiscover found server: {account.protocol.service_endpoint}")
             else:
                 if not server: raise Exception("Server URL required if Autodiscover is off.")
                 self.log(f"Connecting to server: {server}")
@@ -992,10 +1132,10 @@ class UniversalEmailCleanerApp:
         ttk.Entry(self.filter_frame, textvariable=self.criteria_sender, width=30).grid(row=1, column=3, **grid_opts)
 
         ttk.Label(self.filter_frame, text="开始日期 (YYYY-MM-DD):").grid(row=2, column=0, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_start_date, width=30).grid(row=2, column=1, **grid_opts)
+        DateEntry(self.filter_frame, textvariable=self.criteria_start_date).grid(row=2, column=1, **grid_opts)
         
         ttk.Label(self.filter_frame, text="结束日期 (YYYY-MM-DD):").grid(row=2, column=2, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_end_date, width=30).grid(row=2, column=3, **grid_opts)
+        DateEntry(self.filter_frame, textvariable=self.criteria_end_date).grid(row=2, column=3, **grid_opts)
 
         self.lbl_body = ttk.Label(self.filter_frame, text="正文包含:")
         self.lbl_body.grid(row=3, column=0, **grid_opts)
@@ -1007,7 +1147,16 @@ class UniversalEmailCleanerApp:
         opt_frame = ttk.LabelFrame(frame, text="执行选项")
         opt_frame.pack(fill="x", pady=5)
         
-        ttk.Checkbutton(opt_frame, text="仅报告 (不删除)", variable=self.report_only_var).pack(side="left", padx=10)
+        self.btn_start_text = tk.StringVar(value="开始扫描 (Start Scan)")
+        
+        def on_report_only_change():
+            if self.report_only_var.get():
+                self.btn_start_text.set("开始扫描 (Start Scan)")
+            else:
+                self.btn_start_text.set("开始清理 (Start Clean)")
+                messagebox.showwarning("警告", "您已取消 '仅报告' 模式！\n\n接下来的操作将 **永久删除** 数据！\n请务必确认 CSV 和 筛选条件 正确！")
+
+        ttk.Checkbutton(opt_frame, text="仅报告 (不删除)", variable=self.report_only_var, command=on_report_only_change).pack(side="left", padx=10)
         
         ttk.Label(opt_frame, text="| 日志级别:").pack(side="left", padx=5)
         
@@ -1023,7 +1172,7 @@ class UniversalEmailCleanerApp:
         ttk.Radiobutton(opt_frame, text="专家 (Expert)", variable=self.log_level_var, value="Expert", command=on_log_level_click).pack(side="left", padx=5)
 
         # Start
-        ttk.Button(frame, text="开始清理任务", command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
+        ttk.Button(frame, textvariable=self.btn_start_text, command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
 
     def update_ui_for_target(self):
         target = self.cleanup_target_var.get()
@@ -1070,12 +1219,41 @@ class UniversalEmailCleanerApp:
                 self.notebook.select(self.tab_connection)
                 return
 
+        # Date Range Validation for Meetings
+        if self.cleanup_target_var.get() == "Meeting":
+            start_str = self._normalize_date_input(self.criteria_start_date.get())
+            end_str = self._normalize_date_input(self.criteria_end_date.get())
+            if start_str and end_str:
+                try:
+                    s_dt = datetime.strptime(start_str, "%Y-%m-%d")
+                    e_dt = datetime.strptime(end_str, "%Y-%m-%d")
+                    if (e_dt - s_dt).days > 730: # Approx 2 years
+                        messagebox.showwarning("日期范围过大", "会议清理的时间跨度不能超过 2 年。")
+                        return
+                except:
+                    pass
+
+        # Double Confirmation for Deletion
+        if not self.report_only_var.get():
+            confirm1 = messagebox.askyesno("高风险操作确认", "您当前处于【删除模式】！\n\n程序将 **永久删除** 匹配的邮件/会议，且 **无法恢复**。\n\n是否确认继续？")
+            if not confirm1:
+                return
+            
+            confirm2 = messagebox.askyesno("最终确认", "请再次确认：\n\n1. 您已备份重要数据。\n2. 您已确认 CSV 用户列表无误。\n3. 您已确认筛选条件无误。\n\n点击 '是' 将立即开始删除操作！")
+            if not confirm2:
+                return
+
         self.logger.set_level(self.log_level_var.get().upper())
         self.save_config()
         
         threading.Thread(target=self.run_cleanup, daemon=True).start()
 
     def run_cleanup(self):
+        self.log("-" * 60)
+        self.log(f"任务开始: {datetime.now()}")
+        self.log(f"模式: {'仅报告 (Report Only)' if self.report_only_var.get() else '删除 (DELETE)'}")
+        self.log("-" * 60)
+
         source = self.source_type_var.get()
         if source == "Graph":
             self.run_graph_cleanup()
@@ -1462,8 +1640,12 @@ class UniversalEmailCleanerApp:
             # Recurrence Cache
             recurrence_cache = {}
 
+            # Optimization: Set page size for faster retrieval
+            page_size = 100
+
             if target_type == "Email":
-                qs = account.inbox.all()
+                qs = account.inbox.all().order_by('-datetime_received')
+                qs.page_size = page_size
                 if start_dt:
                     qs = qs.filter(datetime_received__gte=start_dt)
                 if end_dt:
@@ -1479,9 +1661,11 @@ class UniversalEmailCleanerApp:
                     
                     self.log(f"使用日历视图 (CalendarView) 展开循环会议: {view_start} -> {view_end}", is_advanced=True)
                     qs = account.calendar.view(start=view_start, end=view_end)
+                    # CalendarView does not support page_size in the same way as QuerySet, but we can try
                 else:
                     self.log("未指定日期范围，使用普通查询 (不展开循环会议实例)", is_advanced=True)
                     qs = account.calendar.all()
+                    qs.page_size = page_size
 
                 if criteria_sender:
                     qs = qs.filter(organizer__icontains=criteria_sender)
@@ -1500,6 +1684,16 @@ class UniversalEmailCleanerApp:
             
             self.log(f"正在查询 EWS...", is_advanced=True)
             
+            # Optimization: Use only() to fetch required fields if possible, but CalendarView is tricky.
+            # For Email, we can optimize.
+            if target_type == "Email":
+                # We need: id, subject, sender, datetime_received, body (if filtered)
+                # Note: 'body' can be heavy. Only fetch if needed.
+                fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
+                if criteria_body:
+                    fields.append('body')
+                qs = qs.only(*fields)
+
             items = list(qs) # Execute query
             if not items:
                 self.log(f"用户 {target_email} 未找到项目。")
