@@ -40,8 +40,8 @@
 
 | 模式 | Graph API | EWS | 说明 |
 |------|-----------|-----|------|
-| **删除 (可恢复)** | `DELETE` 请求 | `SoftDelete` | 邮件进入 Recoverable Items，管理员可通过 eDiscovery 恢复 |
-| **移到已删除文件夹** | `POST .../move` → deleteditems | `MoveToDeletedItems` | 邮件移到 Deleted Items，用户可手动恢复 |
+| **普通删除** | `POST .../move` → deleteditems | `MoveToDeletedItems` | 邮件移到 Deleted Items（已删除文件夹），用户可手动恢复 |
+| **软删除 (可恢复)** | `DELETE` 请求 | `SoftDelete` | 邮件进入 Recoverable Items，管理员可通过 eDiscovery 恢复 |
 | **彻底删除 (不可恢复)** | `POST .../permanentDelete` | `HardDelete` / `Purge` | 永久删除，不进入 Recoverable Items |
 
 ### 交互式扫描结果
@@ -108,7 +108,7 @@ python universal_email_cleaner.py
 3. 选择文件夹范围
 4. 选择执行选项：
    - **仅报告**：只生成 CSV 报告，不删除
-   - **移到已删除文件夹**：移至 Deleted Items，用户可恢复
+   - **软删除**：进入 Recoverable Items，管理员可恢复
    - **彻底删除**：永久删除，不可恢复
 5. 点击「开始扫描」或「开始清理」
 
