@@ -2147,17 +2147,17 @@ class UniversalEmailCleanerApp:
                 if self.permanent_delete_var.get() and self.cleanup_target_var.get() == "Email":
                     messagebox.showwarning(
                         "警告",
-                        "您已取消 '仅报告' 模式，并启用了【彻底删除(不可恢复)】！\n\nGraph 将尝试 permanentDelete（不进入 Recoverable Items）。\nEWS 将尽力使用更强删除类型（具体可恢复性取决于租户策略）。\n\n请务必确认 CSV 和 筛选条件 正确！",
+                        "您已取消 '仅报告' 模式，并启用了【彻底删除(不可恢复)】！\n\nGraph 将尝试 permanentDelete（不进入 Recoverable Items）。\nEWS 将使用 HardDelete（具体可恢复性取决于租户策略）。\n\n请务必确认 CSV 和 筛选条件 正确！",
                     )
                 elif self.soft_delete_var.get() and self.cleanup_target_var.get() == "Email":
                     messagebox.showwarning(
                         "提示",
-                        "您已取消 '仅报告' 模式，并启用了【软删除(移动到 Deleted Items)】。\n\nGraph 将优先使用 move -> deleteditems；EWS 将尽力使用 MoveToDeletedItems。\n\n请务必确认 CSV 和 筛选条件 正确！",
+                        "您已取消 '仅报告' 模式，并启用了【软删除】。\n\n邮件将进入 Recoverable Items（管理员可通过 eDiscovery 恢复）。\nGraph 使用 DELETE；EWS 使用 SoftDelete。\n\n请务必确认 CSV 和 筛选条件 正确！",
                     )
                 else:
                     messagebox.showwarning(
-                        "警告",
-                        "您已取消 '仅报告' 模式！\n\n此删除通常属于可恢复删除（可能进入 Recoverable Items）。\n如需不可恢复删除，请勾选【彻底删除】（仅 Email 生效）。",
+                        "提示",
+                        "您已取消 '仅报告' 模式！\n\n当前为【普通删除】模式，邮件将移至 Deleted Items（用户可手动恢复）。\n如需不可恢复删除，请勾选【彻底删除】（仅 Email 生效）。",
                     )
 
             try:
@@ -2201,7 +2201,7 @@ class UniversalEmailCleanerApp:
 
         self.chk_soft_delete = ttk.Checkbutton(
             opt_frame,
-            text="软删除(移动到 Deleted Items)",
+            text="软删除(进入 Recoverable Items)",
             variable=self.soft_delete_var,
             command=on_soft_delete_change,
         )
@@ -2925,22 +2925,23 @@ class UniversalEmailCleanerApp:
         if not self.report_only_var.get():
             if self.cleanup_target_var.get() == "Email" and self.permanent_delete_var.get():
                 msg = (
-                    "您当前处于【删除模式】并启用了【彻底删除(不可恢复)】！\n\n"
+                    "您当前处于【彻底删除】模式！\n\n"
                     "Graph 将尝试 permanentDelete（不进入 Recoverable Items）。\n"
-                    "EWS 将尽力使用更强删除类型（具体可恢复性取决于租户策略）。\n\n"
-                    "是否确认继续？"
+                    "EWS 将使用 HardDelete。\n\n"
+                    "⚠️ 邮件将永久删除，不可恢复！是否确认继续？"
                 )
             elif self.cleanup_target_var.get() == "Email" and self.soft_delete_var.get():
                 msg = (
-                    "您当前处于【删除模式】并启用了【软删除(移动到 Deleted Items)】。\n\n"
-                    "Graph 将优先使用 move -> deleteditems；EWS 将尽力使用 MoveToDeletedItems。\n\n"
+                    "您当前处于【软删除】模式。\n\n"
+                    "邮件将进入 Recoverable Items（管理员可通过 eDiscovery 恢复）。\n"
+                    "Graph 使用 DELETE；EWS 使用 SoftDelete。\n\n"
                     "是否确认继续？"
                 )
             else:
                 msg = (
-                    "您当前处于【删除模式】！\n\n"
-                    "此删除通常属于可恢复删除（可能进入 Recoverable Items）。\n"
-                    "如需不可恢复删除，请勾选【彻底删除】（仅 Email 生效）。\n\n"
+                    "您当前处于【普通删除】模式。\n\n"
+                    "邮件将移至 Deleted Items（用户可手动恢复）。\n"
+                    "Graph 使用 move -> deleteditems；EWS 使用 MoveToDeletedItems。\n\n"
                     "是否确认继续？"
                 )
 
