@@ -12,15 +12,147 @@ from datetime import datetime, timedelta
 import logging
 import traceback
 import ctypes
+from ctypes import wintypes
 from concurrent.futures import ThreadPoolExecutor
 import calendar
 import webbrowser
 import base64
 import io
+import random
+from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.5.8"
+APP_VERSION = "v1.11.1"
+
+# Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
+# showing a cached/pinned icon from an older shortcut.
+WINDOWS_APP_USER_MODEL_ID = "UniversalEmailCleaner"
 GITHUB_PROJECT_URL = "https://github.com/andylu1988/UniversalEmailCleaner"
 GITHUB_PROFILE_URL = "https://github.com/andylu1988"
+
+
+_thread_local = threading.local()
+
+
+def _get_pooled_session() -> requests.Session:
+    sess = getattr(_thread_local, 'session', None)
+    if sess is not None:
+        return sess
+
+    sess = requests.Session()
+    adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0)
+    sess.mount('https://', adapter)
+    sess.mount('http://', adapter)
+    _thread_local.session = sess
+    return sess
+
+
+def _dpapi_protect_text(plain_text: str) -> str | None:
+    if sys.platform != 'win32':
+        return None
+    try:
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+        data = plain_text.encode('utf-8')
+        in_blob = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_byte)))
+        out_blob = DATA_BLOB()
+
+        # Encrypt for current user (no LOCAL_MACHINE flag)
+        if not crypt32.CryptProtectData(
+            ctypes.byref(in_blob),
+            "UniversalEmailCleaner Graph Token",
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            ctypes.byref(out_blob),
+        ):
+            return None
+
+        try:
+            protected_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+
+        return base64.b64encode(protected_bytes).decode('ascii')
+    except Exception:
+        return None
+
+
+def _dpapi_unprotect_text(protected_b64: str) -> str | None:
+    if sys.platform != 'win32':
+        return None
+    try:
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_byte)),
+            ]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+        protected_bytes = base64.b64decode(protected_b64)
+        in_blob = DATA_BLOB(len(protected_bytes), ctypes.cast(ctypes.create_string_buffer(protected_bytes), ctypes.POINTER(ctypes.c_byte)))
+        out_blob = DATA_BLOB()
+
+        if not crypt32.CryptUnprotectData(
+            ctypes.byref(in_blob),
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            ctypes.byref(out_blob),
+        ):
+            return None
+
+        try:
+            plain_bytes = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+
+        return plain_bytes.decode('utf-8', errors='strict')
+    except Exception:
+        return None
+
+
+def resource_path(relative_path: str) -> str:
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, relative_path)
+
+
+def _win32_force_window_icon(hwnd: int, ico_path: str) -> None:
+    """Force-set the window/taskbar icon on Windows via WM_SETICON.
+
+    Tk's iconbitmap/iconphoto is sometimes ignored by the taskbar on some Windows builds.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        user32 = ctypes.windll.user32
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x0010
+        LR_DEFAULTSIZE = 0x0040
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+
+        hicon = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if not hicon:
+            return
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+    except Exception:
+        pass
 
 try:
     from PIL import Image, ImageTk
@@ -51,7 +183,17 @@ except ImportError:
 
 EXCHANGELIB_ERROR = None
 try:
-    from exchangelib import Account, Credentials, Configuration, DELEGATE, IMPERSONATION, Message, Mailbox, EWSDateTime, CalendarItem
+    from exchangelib import Account, Credentials, Configuration, DELEGATE, IMPERSONATION, Message, Mailbox, EWSDateTime, CalendarItem, NTLM, BASIC
+    from exchangelib import ItemId as EwsItemId
+    try:
+        from exchangelib.items import DeleteType
+    except Exception:
+        DeleteType = None
+    try:
+        from exchangelib import OAuth2Credentials, OAuth2LegacyCredentials
+    except ImportError:
+        OAuth2Credentials = None
+        OAuth2LegacyCredentials = None
     from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
     from exchangelib.properties import FieldPath
     from exchangelib.fields import ExtendedPropertyField
@@ -67,8 +209,13 @@ except ImportError as e:
     class Mailbox: pass
     class EWSDateTime: pass
     class CalendarItem: pass
+    DeleteType = None
+    OAuth2Credentials = None
+    OAuth2LegacyCredentials = None
     DELEGATE = None
     IMPERSONATION = None
+    NTLM = "NTLM"
+    BASIC = "basic"
 
 class DateEntry(ttk.Frame):
     def __init__(self, master, textvariable, mode_var=None, other_date_var=None, **kwargs):
@@ -94,6 +241,11 @@ class DateEntry(ttk.Frame):
         self.top.title("选择日期")
         self.top.geometry("280x280")
         self.top.grab_set()
+
+        try:
+            self.top.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
         
         # Center popup
         x = self.winfo_rootx()
@@ -760,6 +912,37 @@ class UniversalEmailCleanerApp:
         self.root.title(f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)")
         self.root.geometry("1100x900")
         self.root.minsize(900, 700)
+
+        # Improve Windows taskbar icon behavior by setting AppUserModelID
+        # and explicitly setting a Tk iconphoto (some Windows builds ignore iconbitmap for taskbar).
+        try:
+            if sys.platform == 'win32':
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
+        try:
+            self.root.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
+
+        try:
+            if Image is not None and ImageTk is not None:
+                ico_path = resource_path("graph-mail-delete.ico")
+                img = Image.open(ico_path).convert("RGBA")
+                img = img.resize((64, 64))
+                self._app_icon_photo = ImageTk.PhotoImage(img)
+                self.root.iconphoto(True, self._app_icon_photo)
+        except Exception:
+            pass
+
+        # Force taskbar icon (Win32) for stubborn Windows builds.
+        try:
+            if sys.platform == 'win32':
+                self.root.update_idletasks()
+                _win32_force_window_icon(int(self.root.winfo_id()), resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
         
         # Auto-scale font based on DPI if possible, or just use a slightly larger default
         default_font_size = 10
@@ -848,19 +1031,21 @@ class UniversalEmailCleanerApp:
         menubar.add_cascade(label="工具 (Tools)", menu=tools_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="版本历史 (Version History)", command=self.show_history)
         help_menu.add_command(label="关于 (About)", command=self.show_about)
         menubar.add_cascade(label="帮助 (Help)", menu=help_menu)
         root.config(menu=menubar)
 
         # --- Variables ---
         # Graph Config
-        self.graph_auth_mode_var = tk.StringVar(value="Auto") # Auto (Cert) or Manual (Secret)
+        self.graph_auth_mode_var = tk.StringVar(value="Auto") # Auto (Cert) or Manual (Secret) or Token
         self.app_id_var = tk.StringVar()
         self.tenant_id_var = tk.StringVar()
         self.thumbprint_var = tk.StringVar()
         self.client_secret_var = tk.StringVar()
         self.graph_env_var = tk.StringVar(value="Global")
+        self.graph_token_var = tk.StringVar()
+        self.graph_cache_token_var = tk.BooleanVar(value=True)
+        self._graph_token_protected_cache = ""
 
         # EWS Config
         self.ews_server_var = tk.StringVar()
@@ -868,11 +1053,24 @@ class UniversalEmailCleanerApp:
         self.ews_pass_var = tk.StringVar()
         self.ews_auth_type_var = tk.StringVar(value="Impersonation") # Impersonation or Delegate
         self.ews_use_autodiscover = tk.BooleanVar(value=True)
+        # EWS Auth Method: NTLM / Basic (Legacy) / OAuth2 (Modern) / Token
+        self.ews_auth_method_var = tk.StringVar(value="NTLM")
+        self.ews_oauth_app_id_var = tk.StringVar()
+        self.ews_oauth_tenant_id_var = tk.StringVar()
+        self.ews_oauth_secret_var = tk.StringVar()
+        self.ews_token_var = tk.StringVar()
+        self.ews_cache_token_var = tk.BooleanVar(value=True)
+        self._ews_token_protected_cache = ""
 
         # Cleanup Config
         self.source_type_var = tk.StringVar(value="Graph") # Graph or EWS
         self.csv_path_var = tk.StringVar()
+        self.target_single_email_var = tk.StringVar()
         self.report_only_var = tk.BooleanVar(value=True)
+        self.permanent_delete_var = tk.BooleanVar(value=False)
+        # Soft delete: move items to Deleted Items (best-effort).
+        # Default OFF to preserve existing behavior.
+        self.soft_delete_var = tk.BooleanVar(value=False)
         # self.log_level_var is already defined in menu setup
         
         # Cleanup Target
@@ -889,6 +1087,22 @@ class UniversalEmailCleanerApp:
         self.criteria_end_date = tk.StringVar()
         self.criteria_item_class = tk.StringVar(value="IPM.Note")
 
+        # Email folder scan scope
+        # Keep existing behavior by default:
+        # - Graph: All mailbox (messages)
+        # - EWS: Inbox only
+        self.mail_folder_scope_var = tk.StringVar(value="自动 (Auto)")
+
+        # Progress tracking
+        self._progress_total = 0
+        self._progress_done = 0
+
+        # Scan results cache for interactive deletion
+        self._scan_results_data: list[dict] = []   # rows from CSV
+        self._scan_results_columns: list[str] = [] # column headers
+        self._last_report_path: str = ""            # path of most recent report CSV
+        self._scan_checked: dict[str, bool] = {}   # iid -> checked
+
         # --- UI Layout ---
         main_frame = ttk.Frame(root)
         main_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -902,6 +1116,9 @@ class UniversalEmailCleanerApp:
         
         self.tab_cleanup = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_cleanup, text="2. 任务配置")
+
+        self.tab_results = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_results, text="3. 扫描结果")
 
         # Log Area
         log_frame = ttk.LabelFrame(main_frame, text="运行日志")
@@ -965,6 +1182,7 @@ class UniversalEmailCleanerApp:
         # Build Tabs
         self.build_connection_tab()
         self.build_cleanup_tab()
+        self.build_results_tab()
 
         self.load_config()
         
@@ -983,6 +1201,7 @@ class UniversalEmailCleanerApp:
         self.logger.log(msg, level, is_advanced)
 
     def update_report_link(self, path):
+        self._last_report_path = path
         def _update():
             self.report_link_lbl.config(text=f"最新报告: {path}")
             self.report_link_lbl.bind("<Button-1>", lambda e: os.startfile(path) if os.path.exists(path) else None)
@@ -992,6 +1211,11 @@ class UniversalEmailCleanerApp:
         history_window = tk.Toplevel(self.root)
         history_window.title("版本历史")
         history_window.geometry("600x400")
+
+        try:
+            history_window.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
         
         txt = scrolledtext.ScrolledText(history_window, padx=10, pady=10)
         txt.pack(fill="both", expand=True)
@@ -1019,6 +1243,11 @@ class UniversalEmailCleanerApp:
         about.geometry("520x260")
         about.transient(self.root)
         about.grab_set()
+
+        try:
+            about.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
 
         outer = ttk.Frame(about, padding=12)
         outer.pack(fill="both", expand=True)
@@ -1091,14 +1320,55 @@ class UniversalEmailCleanerApp:
                     self.thumbprint_var.set(config.get('thumbprint', ''))
                     self.client_secret_var.set(config.get('client_secret', ''))
                     self.graph_env_var.set(config.get('graph_env', 'Global'))
+                    try:
+                        self.graph_cache_token_var.set(bool(config.get('graph_cache_token', True)))
+                    except Exception:
+                        pass
+                    try:
+                        self._graph_token_protected_cache = config.get('graph_token_protected', '') or ''
+                    except Exception:
+                        self._graph_token_protected_cache = ''
                     # EWS
                     self.ews_server_var.set(config.get('ews_server', ''))
                     self.ews_user_var.set(config.get('ews_user', ''))
                     self.ews_use_autodiscover.set(config.get('ews_autodiscover', True))
                     self.ews_auth_type_var.set(config.get('ews_auth_type', 'Impersonation'))
+                    self.ews_auth_method_var.set(config.get('ews_auth_method', 'NTLM'))
+                    self.ews_oauth_app_id_var.set(config.get('ews_oauth_app_id', ''))
+                    self.ews_oauth_tenant_id_var.set(config.get('ews_oauth_tenant_id', ''))
+                    self.ews_oauth_secret_var.set(config.get('ews_oauth_secret', ''))
+                    try:
+                        self.ews_cache_token_var.set(bool(config.get('ews_cache_token', True)))
+                    except Exception:
+                        pass
+                    try:
+                        self._ews_token_protected_cache = config.get('ews_token_protected', '') or ''
+                    except Exception:
+                        self._ews_token_protected_cache = ''
                     # Common
                     self.source_type_var.set(config.get('source_type', 'EWS')) # Default to EWS if not set
                     self.csv_path_var.set(config.get('csv_path', ''))
+                    try:
+                        self.target_single_email_var.set(config.get('target_single_email', ''))
+                    except Exception:
+                        pass
+                    try:
+                        self.mail_folder_scope_var.set(config.get('mail_folder_scope', '自动 (Auto)'))
+                    except Exception:
+                        pass
+                    try:
+                        self.permanent_delete_var.set(bool(config.get('permanent_delete', False)))
+                    except Exception:
+                        pass
+                    try:
+                        self.soft_delete_var.set(bool(config.get('soft_delete', False)))
+                    except Exception:
+                        pass
+                    try:
+                        if bool(self.permanent_delete_var.get()) and bool(self.soft_delete_var.get()):
+                            self.soft_delete_var.set(False)
+                    except Exception:
+                        pass
                     self.log(">>> 配置已加载。")
             except Exception as e:
                 self.log(f"X 加载配置失败: {e}", "ERROR")
@@ -1108,6 +1378,51 @@ class UniversalEmailCleanerApp:
             self.toggle_connection_ui()
 
     def save_config(self):
+        # Keep DPAPI-protected token blob separate from plain UI value.
+        # Graph token caching
+        try:
+            cache_enabled = bool(self.graph_cache_token_var.get())
+        except Exception:
+            cache_enabled = True
+
+        token_ui = ""
+        try:
+            token_ui = (self.graph_token_var.get() or '').strip()
+        except Exception:
+            token_ui = ""
+        if token_ui.lower().startswith('bearer '):
+            token_ui = token_ui[7:].strip()
+
+        if not cache_enabled:
+            self._graph_token_protected_cache = ""
+        else:
+            if token_ui:
+                protected = _dpapi_protect_text(token_ui)
+                if protected:
+                    self._graph_token_protected_cache = protected
+
+        # EWS token caching
+        try:
+            ews_cache_enabled = bool(self.ews_cache_token_var.get())
+        except Exception:
+            ews_cache_enabled = True
+
+        ews_token_ui = ""
+        try:
+            ews_token_ui = (self.ews_token_var.get() or '').strip()
+        except Exception:
+            ews_token_ui = ""
+        if ews_token_ui.lower().startswith('bearer '):
+            ews_token_ui = ews_token_ui[7:].strip()
+
+        if not ews_cache_enabled:
+            self._ews_token_protected_cache = ""
+        else:
+            if ews_token_ui:
+                protected = _dpapi_protect_text(ews_token_ui)
+                if protected:
+                    self._ews_token_protected_cache = protected
+
         config = {
             'graph_auth_mode': self.graph_auth_mode_var.get(),
             'app_id': self.app_id_var.get(),
@@ -1115,12 +1430,24 @@ class UniversalEmailCleanerApp:
             'thumbprint': self.thumbprint_var.get(),
             'client_secret': self.client_secret_var.get(),
             'graph_env': self.graph_env_var.get(),
+            'graph_cache_token': bool(self.graph_cache_token_var.get()),
+            'graph_token_protected': self._graph_token_protected_cache,
             'ews_server': self.ews_server_var.get(),
             'ews_user': self.ews_user_var.get(),
             'ews_autodiscover': self.ews_use_autodiscover.get(),
             'ews_auth_type': self.ews_auth_type_var.get(),
+            'ews_auth_method': self.ews_auth_method_var.get(),
+            'ews_oauth_app_id': self.ews_oauth_app_id_var.get(),
+            'ews_oauth_tenant_id': self.ews_oauth_tenant_id_var.get(),
+            'ews_oauth_secret': self.ews_oauth_secret_var.get(),
+            'ews_cache_token': bool(self.ews_cache_token_var.get()),
+            'ews_token_protected': self._ews_token_protected_cache,
             'source_type': self.source_type_var.get(),
-            'csv_path': self.csv_path_var.get()
+            'csv_path': self.csv_path_var.get(),
+            'target_single_email': self.target_single_email_var.get(),
+            'mail_folder_scope': self.mail_folder_scope_var.get(),
+            'permanent_delete': bool(self.permanent_delete_var.get()),
+            'soft_delete': bool(self.soft_delete_var.get()),
         }
         try:
             with open(self.config_file_path, 'w', encoding='utf-8') as f:
@@ -1142,36 +1469,107 @@ class UniversalEmailCleanerApp:
         ttk.Radiobutton(type_frame, text="Microsoft Graph API", variable=self.source_type_var, value="Graph", command=self.toggle_connection_ui).pack(side="left", padx=20, pady=10)
 
         # 2. EWS Configuration Frame
-        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange On-Premise)")
+        self.ews_frame = ttk.LabelFrame(main_frame, text="EWS 配置 (Exchange On-Premise / Online)")
         self.ews_frame.pack(fill="x", pady=5, ipady=5)
-        
-        ews_grid = ttk.Frame(self.ews_frame)
-        ews_grid.pack(anchor="w", padx=10, pady=5)
 
-        # Server
-        ttk.Label(ews_grid, text="EWS 服务器:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        # --- EWS Auth Method Selection ---
+        ews_method_frame = ttk.Frame(self.ews_frame)
+        ews_method_frame.pack(fill="x", padx=10, pady=(5, 2))
+        ttk.Label(ews_method_frame, text="验证方式:").pack(side="left")
+        ttk.Radiobutton(ews_method_frame, text="NTLM", variable=self.ews_auth_method_var, value="NTLM", command=self.toggle_ews_auth_ui).pack(side="left", padx=5)
+        ttk.Radiobutton(ews_method_frame, text="Basic (Legacy)", variable=self.ews_auth_method_var, value="Basic", command=self.toggle_ews_auth_ui).pack(side="left", padx=5)
+        ttk.Radiobutton(ews_method_frame, text="OAuth2 (Modern)", variable=self.ews_auth_method_var, value="OAuth2", command=self.toggle_ews_auth_ui).pack(side="left", padx=5)
+        ttk.Radiobutton(ews_method_frame, text="直接输入 Token", variable=self.ews_auth_method_var, value="Token", command=self.toggle_ews_auth_ui).pack(side="left", padx=5)
+
+        # --- EWS NTLM Frame (same fields as Basic — UPN + Password) ---
+        self.ews_ntlm_frame = ttk.Frame(self.ews_frame)
+        ews_ntlm_grid = ttk.Frame(self.ews_ntlm_frame)
+        ews_ntlm_grid.pack(anchor="w", padx=10, pady=5)
+        grid_opts = {"sticky": "w", "padx": 5, "pady": 5}
+
+        ttk.Label(ews_ntlm_grid, text="管理员账号 (UPN 或 DOMAIN\\User):").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(ews_ntlm_grid, textvariable=self.ews_user_var, width=40).grid(row=0, column=1, **grid_opts)
+
+        ttk.Label(ews_ntlm_grid, text="管理员密码:").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(ews_ntlm_grid, textvariable=self.ews_pass_var, show="*", width=40).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(ews_ntlm_grid, text="NTLM 适用于本地 Exchange 或混合部署 (域账号)。").grid(row=2, column=1, **grid_opts)
+
+        # --- EWS Basic (Legacy) Frame ---
+        self.ews_basic_frame = ttk.Frame(self.ews_frame)
+        ews_basic_grid = ttk.Frame(self.ews_basic_frame)
+        ews_basic_grid.pack(anchor="w", padx=10, pady=5)
+
+        ttk.Label(ews_basic_grid, text="管理员账号 (UPN):").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(ews_basic_grid, textvariable=self.ews_user_var, width=40).grid(row=0, column=1, **grid_opts)
+
+        ttk.Label(ews_basic_grid, text="管理员密码:").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(ews_basic_grid, textvariable=self.ews_pass_var, show="*", width=40).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(ews_basic_grid, text="Basic Auth 已被 Microsoft 365 弃用，仅适用于旧版本 Exchange。").grid(row=2, column=1, **grid_opts)
+
+        # --- EWS OAuth2 (Modern) Frame ---
+        self.ews_oauth2_frame = ttk.Frame(self.ews_frame)
+        ews_oauth2_grid = ttk.Frame(self.ews_oauth2_frame)
+        ews_oauth2_grid.pack(anchor="w", padx=10, pady=5)
+
+        ttk.Label(ews_oauth2_grid, text="Application ID:").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(ews_oauth2_grid, textvariable=self.ews_oauth_app_id_var, width=50).grid(row=0, column=1, **grid_opts)
+
+        ttk.Label(ews_oauth2_grid, text="Tenant ID:").grid(row=1, column=0, **grid_opts)
+        ttk.Entry(ews_oauth2_grid, textvariable=self.ews_oauth_tenant_id_var, width=50).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(ews_oauth2_grid, text="Client Secret:").grid(row=2, column=0, **grid_opts)
+        ttk.Entry(ews_oauth2_grid, textvariable=self.ews_oauth_secret_var, width=50, show="*").grid(row=2, column=1, **grid_opts)
+
+        ttk.Label(
+            ews_oauth2_grid,
+            text="使用 Client Credentials 流程获取 EWS 访问令牌 (需 full_access_as_app 权限)",
+        ).grid(row=3, column=1, **grid_opts)
+
+        # --- EWS Token Frame ---
+        self.ews_token_frame = ttk.Frame(self.ews_frame)
+        ews_token_grid = ttk.Frame(self.ews_token_frame)
+        ews_token_grid.pack(anchor="w", fill="x", expand=True, padx=10, pady=5)
+
+        ttk.Label(ews_token_grid, text="Access Token (Bearer):").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(ews_token_grid, textvariable=self.ews_token_var, width=60, show="*").grid(row=0, column=1, **grid_opts)
+
+        ttk.Checkbutton(
+            ews_token_grid,
+            text="加密缓存 Token (Windows 当前用户 / DPAPI)",
+            variable=self.ews_cache_token_var,
+        ).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(
+            ews_token_grid,
+            text="提示：Token 通常有过期时间。留空则尝试使用已缓存 Token。",
+        ).grid(row=2, column=1, **grid_opts)
+
+        # --- EWS Common Settings (Server / Autodiscover / Access Type) ---
+        ews_common_frame = ttk.Frame(self.ews_frame)
+        ews_common_frame.pack(fill="x", padx=10, pady=2)
+        ews_grid = ttk.Frame(ews_common_frame)
+        ews_grid.pack(anchor="w")
+
+        ttk.Label(ews_grid, text="EWS 服务器:").grid(row=0, column=0, **grid_opts)
         self.entry_ews_server = ttk.Entry(ews_grid, textvariable=self.ews_server_var, width=40)
-        self.entry_ews_server.grid(row=0, column=1, padx=5, pady=5)
+        self.entry_ews_server.grid(row=0, column=1, **grid_opts)
         
         self.chk_ews_auto = ttk.Checkbutton(ews_grid, text="使用自动发现 (Autodiscover)", variable=self.ews_use_autodiscover, 
                                    command=lambda: self.entry_ews_server.config(state='disabled' if self.ews_use_autodiscover.get() else 'normal'))
         self.chk_ews_auto.grid(row=0, column=2, padx=5)
-        
-        # Credentials
-        ttk.Label(ews_grid, text="管理员账号 (UPN):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(ews_grid, textvariable=self.ews_user_var, width=40).grid(row=1, column=1, padx=5, pady=5)
 
-        ttk.Label(ews_grid, text="管理员密码:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        ttk.Entry(ews_grid, textvariable=self.ews_pass_var, show="*", width=40).grid(row=2, column=1, padx=5, pady=5)
-
-        # Auth Type
-        ttk.Label(ews_grid, text="访问类型:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(ews_grid, text="访问类型:").grid(row=1, column=0, **grid_opts)
         auth_frame = ttk.Frame(ews_grid)
-        auth_frame.grid(row=3, column=1, sticky="w")
+        auth_frame.grid(row=1, column=1, sticky="w")
         ttk.Radiobutton(auth_frame, text="模拟 (Impersonation)", variable=self.ews_auth_type_var, value="Impersonation").pack(side="left", padx=5)
         ttk.Radiobutton(auth_frame, text="代理 (Delegate)", variable=self.ews_auth_type_var, value="Delegate").pack(side="left", padx=5)
 
         ttk.Button(self.ews_frame, text="测试 EWS 连接", command=self.test_ews_connection).pack(anchor="w", padx=10, pady=10)
+
+        # Show correct auth frame initially
+        self.toggle_ews_auth_ui()
 
         # 3. Graph Configuration Frame
         self.graph_frame = ttk.LabelFrame(main_frame, text="Graph API 配置 (Exchange Online)")
@@ -1196,6 +1594,7 @@ class UniversalEmailCleanerApp:
         ttk.Label(mode_frame, text="配置方式:").pack(side="left")
         ttk.Radiobutton(mode_frame, text="自动配置 (证书)", variable=self.graph_auth_mode_var, value="Auto", command=self.toggle_graph_ui).pack(side="left", padx=5)
         ttk.Radiobutton(mode_frame, text="手动配置 (Secret)", variable=self.graph_auth_mode_var, value="Manual", command=self.toggle_graph_ui).pack(side="left", padx=5)
+        ttk.Radiobutton(mode_frame, text="直接输入 Token", variable=self.graph_auth_mode_var, value="Token", command=self.toggle_graph_ui).pack(side="left", padx=5)
 
         # Graph Auto Frame
         self.graph_auto_frame = ttk.Frame(self.graph_frame)
@@ -1222,6 +1621,25 @@ class UniversalEmailCleanerApp:
         ttk.Label(manual_grid, text="客户端密钥 (Client Secret):").grid(row=2, column=0, **grid_opts)
         ttk.Entry(manual_grid, textvariable=self.client_secret_var, width=50, show="*").grid(row=2, column=1, **grid_opts)
 
+        # Graph Token Frame
+        self.graph_token_frame = ttk.Frame(self.graph_frame)
+        token_grid = ttk.Frame(self.graph_token_frame)
+        token_grid.pack(anchor="w", fill="x", expand=True)
+
+        ttk.Label(token_grid, text="Access Token (Bearer):").grid(row=0, column=0, **grid_opts)
+        ttk.Entry(token_grid, textvariable=self.graph_token_var, width=60, show="*").grid(row=0, column=1, **grid_opts)
+
+        ttk.Checkbutton(
+            token_grid,
+            text="加密缓存 Token (Windows 当前用户 / DPAPI)",
+            variable=self.graph_cache_token_var,
+        ).grid(row=1, column=1, **grid_opts)
+
+        ttk.Label(
+            token_grid,
+            text="提示：Token 通常有过期时间。留空则尝试使用已缓存 Token。",
+        ).grid(row=2, column=1, **grid_opts)
+
         # Initial Toggle
         self.toggle_connection_ui()
 
@@ -1230,6 +1648,7 @@ class UniversalEmailCleanerApp:
         if mode == "EWS":
             self._enable_frame(self.ews_frame)
             self._disable_frame(self.graph_frame)
+            self.toggle_ews_auth_ui()
         else:
             self._disable_frame(self.ews_frame)
             self._enable_frame(self.graph_frame)
@@ -1242,10 +1661,39 @@ class UniversalEmailCleanerApp:
         mode = self.graph_auth_mode_var.get()
         if mode == "Auto":
             self.graph_manual_frame.pack_forget()
+            try:
+                self.graph_token_frame.pack_forget()
+            except Exception:
+                pass
             self.graph_auto_frame.pack(fill="x", padx=10, pady=5)
-        else:
+        elif mode == "Manual":
             self.graph_auto_frame.pack_forget()
+            try:
+                self.graph_token_frame.pack_forget()
+            except Exception:
+                pass
             self.graph_manual_frame.pack(fill="x", padx=10, pady=5)
+        else:  # Token
+            self.graph_auto_frame.pack_forget()
+            self.graph_manual_frame.pack_forget()
+            self.graph_token_frame.pack(fill="x", padx=10, pady=5)
+
+    def toggle_ews_auth_ui(self):
+        """Show/hide EWS auth sub-frames based on selected auth method."""
+        method = self.ews_auth_method_var.get()
+        for f in (self.ews_ntlm_frame, self.ews_basic_frame, self.ews_oauth2_frame, self.ews_token_frame):
+            try:
+                f.pack_forget()
+            except Exception:
+                pass
+        if method == "NTLM":
+            self.ews_ntlm_frame.pack(fill="x", padx=10, pady=2)
+        elif method == "Basic":
+            self.ews_basic_frame.pack(fill="x", padx=10, pady=2)
+        elif method == "OAuth2":
+            self.ews_oauth2_frame.pack(fill="x", padx=10, pady=2)
+        else:  # Token
+            self.ews_token_frame.pack(fill="x", padx=10, pady=2)
 
     def _enable_frame(self, frame):
         for child in frame.winfo_children():
@@ -1460,33 +1908,126 @@ class UniversalEmailCleanerApp:
             
         return date_str # Return original if parse fails
 
+    def _get_ews_access_token_oauth2(self):
+        """Obtain an EWS access token via OAuth2 Client Credentials flow."""
+        app_id = self.ews_oauth_app_id_var.get().strip()
+        tenant_id = self.ews_oauth_tenant_id_var.get().strip()
+        secret = self.ews_oauth_secret_var.get().strip()
+        if not app_id or not tenant_id or not secret:
+            raise Exception("OAuth2 模式需要 Application ID, Tenant ID 和 Client Secret。")
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": app_id,
+            "client_secret": secret,
+            "scope": "https://outlook.office365.com/.default",
+        }
+        resp = requests.post(token_url, data=data)
+        if resp.status_code != 200:
+            raise Exception(f"OAuth2 token 获取失败: {resp.status_code} {resp.text}")
+        token = resp.json().get("access_token")
+        if not token:
+            raise Exception("OAuth2 返回中缺少 access_token")
+        return token
+
+    def _get_ews_credentials(self):
+        """Return (credentials_or_None, access_token_or_None) based on current EWS auth method."""
+        method = self.ews_auth_method_var.get()
+        if method in ("Basic", "NTLM"):
+            user = self.ews_user_var.get()
+            pwd = self.ews_pass_var.get()
+            if not user or not pwd:
+                raise Exception(f"{method} 模式需要用户名和密码。")
+            return Credentials(user, pwd), None
+
+        if method == "OAuth2":
+            token = self._get_ews_access_token_oauth2()
+            if OAuth2Credentials is not None:
+                creds = OAuth2Credentials(
+                    client_id=self.ews_oauth_app_id_var.get().strip(),
+                    client_secret=self.ews_oauth_secret_var.get().strip(),
+                    tenant_id=self.ews_oauth_tenant_id_var.get().strip(),
+                )
+                return creds, token
+            return None, token
+
+        # Token mode
+        token_ui = (self.ews_token_var.get() or '').strip()
+        if token_ui.lower().startswith('bearer '):
+            token_ui = token_ui[7:].strip()
+        token = token_ui
+        from_cache = False
+        if not token:
+            protected = getattr(self, '_ews_token_protected_cache', '') or ''
+            if protected:
+                token = _dpapi_unprotect_text(protected) or ''
+                from_cache = True
+        if not token:
+            raise Exception("未提供 Token，且无法从缓存读取 Token")
+        # Refresh cache
+        try:
+            cache_enabled = bool(self.ews_cache_token_var.get())
+        except Exception:
+            cache_enabled = True
+        if cache_enabled and (not from_cache) and token:
+            protected_new = _dpapi_protect_text(token)
+            if protected_new:
+                self._ews_token_protected_cache = protected_new
+                try:
+                    self.save_config()
+                except Exception:
+                    pass
+        return None, token
+
     def _test_ews(self):
         try:
             self.log(">>> 正在测试 EWS 连接...")
-            user = self.ews_user_var.get()
-            pwd = self.ews_pass_var.get()
+            method = self.ews_auth_method_var.get()
             server = self._clean_server_address(self.ews_server_var.get())
             use_auto = self.ews_use_autodiscover.get()
 
-            if not user or not pwd:
-                raise Exception("需要用户名和密码。")
+            creds, token = self._get_ews_credentials()
 
-            credentials = Credentials(user, pwd)
-            
-            if use_auto:
-                self.log("Using Autodiscover...")
-                account = Account(primary_smtp_address=user, credentials=credentials, autodiscover=True)
-                # Update server var if successful
-                if account.protocol.service_endpoint:
-                    self.ews_server_var.set(account.protocol.service_endpoint)
-                    self.log(f"Autodiscover found server: {account.protocol.service_endpoint}")
+            # Determine exchangelib auth_type for NTLM vs Basic
+            ews_proto_auth_type = None
+            if method == "NTLM":
+                ews_proto_auth_type = NTLM
+            elif method == "Basic":
+                ews_proto_auth_type = BASIC
+
+            # Determine primary_smtp_address for testing
+            test_email = self.ews_user_var.get().strip() or self.target_single_email_var.get().strip()
+            if not test_email:
+                raise Exception("请填写管理员账号 (UPN) 或单个目标邮箱，以便测试连接。")
+
+            if token and creds is None:
+                # Pure bearer token mode
+                self.log("Token 模式：尝试直接 HTTP 验证...")
+                ews_url = f"https://{server or 'outlook.office365.com'}/ews/exchange.asmx" if not use_auto else "https://outlook.office365.com/ews/exchange.asmx"
+                resp = requests.get(ews_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+                if resp.status_code in (200, 302, 401):
+                    self.log(f"√ EWS 端点可达 (HTTP {resp.status_code})。如果 401，请检查 Token 是否有效。")
+                else:
+                    self.log(f"EWS 端点返回 HTTP {resp.status_code}", level="ERROR")
             else:
-                if not server: raise Exception("Server URL required if Autodiscover is off.")
-                self.log(f"Connecting to server: {server}")
-                config = Configuration(server=server, credentials=credentials)
-                account = Account(primary_smtp_address=user, config=config, autodiscover=False)
+                if use_auto:
+                    self.log(f"Using Autodiscover ({method})...")
+                    account = Account(primary_smtp_address=test_email, credentials=creds, autodiscover=True)
+                    if account.protocol.service_endpoint:
+                        self.ews_server_var.set(account.protocol.service_endpoint)
+                        self.log(f"Autodiscover found server: {account.protocol.service_endpoint}")
+                else:
+                    if not server:
+                        raise Exception("Server URL required if Autodiscover is off.")
+                    self.log(f"Connecting to server: {server} ({method})")
+                    config_kwargs = {"server": server, "credentials": creds}
+                    if ews_proto_auth_type:
+                        config_kwargs["auth_type"] = ews_proto_auth_type
+                    config = Configuration(**config_kwargs)
+                    account = Account(primary_smtp_address=test_email, config=config, autodiscover=False)
 
-            self.log(f"√ Connection Successful! Server: {account.protocol.service_endpoint}")
+                self.log(f"√ Connection Successful! Server: {account.protocol.service_endpoint}")
+
             self.save_config()
         except Exception as e:
             self.log(f"X Connection Failed: {e}", "ERROR")
@@ -1499,14 +2040,54 @@ class UniversalEmailCleanerApp:
         # Source Selection
         src_frame = ttk.LabelFrame(frame, text="源系统 & 目标")
         src_frame.pack(fill="x", pady=5)
-        
-        ttk.Label(src_frame, text="源系统:").pack(side="left", padx=5)
-        ttk.Radiobutton(src_frame, text="Graph API", variable=self.source_type_var, value="Graph").pack(side="left", padx=5)
-        ttk.Radiobutton(src_frame, text="Exchange EWS", variable=self.source_type_var, value="EWS").pack(side="left", padx=5)
-        
-        ttk.Label(src_frame, text="| 目标用户 CSV:").pack(side="left", padx=5)
-        ttk.Entry(src_frame, textvariable=self.csv_path_var, width=50).pack(side="left", padx=5)
-        ttk.Button(src_frame, text="浏览...", command=lambda: self.csv_path_var.set(filedialog.askopenfilename(filetypes=[("CSV", "*.csv")]))).pack(side="left")
+
+        src_row1 = ttk.Frame(src_frame)
+        src_row1.pack(fill="x", padx=5, pady=(5, 2))
+
+        src_row2 = ttk.Frame(src_frame)
+        src_row2.pack(fill="x", padx=5, pady=(2, 5))
+
+        ttk.Label(src_row1, text="源系统:").pack(side="left", padx=(0, 5))
+        ttk.Radiobutton(src_row1, text="Graph API", variable=self.source_type_var, value="Graph").pack(side="left", padx=5)
+        ttk.Radiobutton(src_row1, text="Exchange EWS", variable=self.source_type_var, value="EWS").pack(side="left", padx=5)
+
+        ttk.Label(src_row1, text="| 目标用户 CSV:").pack(side="left", padx=5)
+        self.entry_csv_path = ttk.Entry(src_row1, textvariable=self.csv_path_var, width=50)
+        self.entry_csv_path.pack(side="left", padx=5)
+        self.btn_csv_browse = ttk.Button(
+            src_row1,
+            text="浏览...",
+            command=lambda: self.csv_path_var.set(filedialog.askopenfilename(filetypes=[("CSV", "*.csv")]))
+        )
+        self.btn_csv_browse.pack(side="left")
+
+        # TXT mailbox list import
+        self.btn_txt_import = ttk.Button(
+            src_row1,
+            text="导入TXT邮箱列表...",
+            command=self._import_mailbox_txt,
+        )
+        self.btn_txt_import.pack(side="left", padx=(5, 0))
+
+        ttk.Label(src_row2, text="单个目标邮箱:").pack(side="left", padx=(0, 5))
+        self.entry_single_target = ttk.Entry(src_row2, textvariable=self.target_single_email_var, width=40)
+        self.entry_single_target.pack(side="left", padx=5)
+        ttk.Label(src_row2, text="(填写后将忽略并禁用 CSV)").pack(side="left", padx=5)
+
+        def _sync_target_input_state(*_args):
+            has_single = bool((self.target_single_email_var.get() or '').strip())
+            try:
+                self.entry_csv_path.configure(state='disabled' if has_single else 'normal')
+                self.btn_csv_browse.configure(state='disabled' if has_single else 'normal')
+            except Exception:
+                pass
+
+        try:
+            self.target_single_email_var.trace_add('write', _sync_target_input_state)
+        except Exception:
+            pass
+
+        _sync_target_input_state()
 
         # Target Selection
         target_frame = ttk.LabelFrame(frame, text="清理对象类型")
@@ -1571,9 +2152,110 @@ class UniversalEmailCleanerApp:
                 self.btn_start_text.set("开始扫描 (Start Scan)")
             else:
                 self.btn_start_text.set("开始清理 (Start Clean)")
-                messagebox.showwarning("警告", "您已取消 '仅报告' 模式！\n\n接下来的操作将 **永久删除** 数据！\n请务必确认 CSV 和 筛选条件 正确！")
+                if self.permanent_delete_var.get() and self.cleanup_target_var.get() == "Email":
+                    messagebox.showwarning(
+                        "警告",
+                        "您已取消 '仅报告' 模式，并启用了【彻底删除(不可恢复)】！\n\nGraph 将尝试 permanentDelete（不进入 Recoverable Items）。\nEWS 将尽力使用更强删除类型（具体可恢复性取决于租户策略）。\n\n请务必确认 CSV 和 筛选条件 正确！",
+                    )
+                elif self.soft_delete_var.get() and self.cleanup_target_var.get() == "Email":
+                    messagebox.showwarning(
+                        "提示",
+                        "您已取消 '仅报告' 模式，并启用了【软删除(移动到 Deleted Items)】。\n\nGraph 将优先使用 move -> deleteditems；EWS 将尽力使用 MoveToDeletedItems。\n\n请务必确认 CSV 和 筛选条件 正确！",
+                    )
+                else:
+                    messagebox.showwarning(
+                        "警告",
+                        "您已取消 '仅报告' 模式！\n\n此删除通常属于可恢复删除（可能进入 Recoverable Items）。\n如需不可恢复删除，请勾选【彻底删除】（仅 Email 生效）。",
+                    )
+
+            try:
+                if self.report_only_var.get():
+                    self.chk_permanent_delete.configure(state="disabled")
+                    try:
+                        self.chk_soft_delete.configure(state="disabled")
+                    except Exception:
+                        pass
+                else:
+                    self.chk_permanent_delete.configure(state="normal" if self.cleanup_target_var.get() == "Email" else "disabled")
+                    try:
+                        self.chk_soft_delete.configure(state="normal" if self.cleanup_target_var.get() == "Email" else "disabled")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def on_permanent_delete_change():
+            # Keep checkbox meaningful
+            if self.permanent_delete_var.get() and self.report_only_var.get():
+                self.report_only_var.set(False)
+                on_report_only_change()
+            if self.permanent_delete_var.get():
+                try:
+                    self.soft_delete_var.set(False)
+                except Exception:
+                    pass
+
+        def on_soft_delete_change():
+            if self.soft_delete_var.get() and self.report_only_var.get():
+                self.report_only_var.set(False)
+                on_report_only_change()
+            if self.soft_delete_var.get():
+                try:
+                    self.permanent_delete_var.set(False)
+                except Exception:
+                    pass
 
         ttk.Checkbutton(opt_frame, text="仅报告 (不删除)", variable=self.report_only_var, command=on_report_only_change).pack(side="left", padx=10)
+
+        self.chk_soft_delete = ttk.Checkbutton(
+            opt_frame,
+            text="软删除(移动到 Deleted Items)",
+            variable=self.soft_delete_var,
+            command=on_soft_delete_change,
+        )
+        self.chk_soft_delete.pack(side="left", padx=5)
+
+        self.chk_permanent_delete = ttk.Checkbutton(
+            opt_frame,
+            text="彻底删除(不可恢复)",
+            variable=self.permanent_delete_var,
+            command=on_permanent_delete_change,
+        )
+        self.chk_permanent_delete.pack(side="left", padx=5)
+        try:
+            self.chk_permanent_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
+            self.chk_soft_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
+        except Exception:
+            pass
+
+        ttk.Label(opt_frame, text="| 文件夹范围(Email):").pack(side="left", padx=5)
+        self.mail_folder_scope_cb = ttk.Combobox(
+            opt_frame,
+            textvariable=self.mail_folder_scope_var,
+            values=[
+                "自动 (Auto)",
+                "仅收件箱 (Inbox only)",
+                "收件箱及子文件夹 (Inbox + Subfolders)",
+                "常用文件夹 (Common: Inbox/Outbox/Sent/Deleted/Junk/Drafts/Archive)",
+                "仅已发送 (Sent Items only)",
+                "仅发件箱 (Outbox only)",
+                "仅已删除 (Deleted Items only)",
+                "仅可恢复删除 (Recoverable Items - Deletions)",
+                "仅可恢复清除 (Recoverable Items - Purges)",
+                "仅垃圾邮件 (Junk Email only)",
+                "仅草稿 (Drafts only)",
+                "仅存档 (Archive only)",
+                "全邮箱 (All folders)",
+            ],
+            state="readonly",
+            width=28,
+        )
+        try:
+            if not (self.mail_folder_scope_var.get() or "").strip():
+                self.mail_folder_scope_var.set("自动 (Auto)")
+        except Exception:
+            pass
+        self.mail_folder_scope_cb.pack(side="left", padx=5)
         
         ttk.Label(opt_frame, text="| 日志级别:").pack(side="left", padx=5)
         
@@ -1597,11 +2279,454 @@ class UniversalEmailCleanerApp:
         # Start
         ttk.Button(frame, textvariable=self.btn_start_text, command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
 
+        # Progress bar
+        progress_frame = ttk.Frame(frame)
+        progress_frame.pack(fill="x", pady=(0, 5))
+
+        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", length=600)
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        self._progress_label_var = tk.StringVar(value="")
+        self._progress_label = ttk.Label(progress_frame, textvariable=self._progress_label_var, width=30)
+        self._progress_label.pack(side="right")
+
+    # --- Tab 3: Scan Results ---
+    def build_results_tab(self):
+        frame = ttk.Frame(self.tab_results, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        # --- Row 1: Info label ---
+        info_frame = ttk.Frame(frame)
+        info_frame.pack(fill="x", pady=(0, 3))
+        self._results_info_var = tk.StringVar(value="尚无扫描结果。请先在「任务配置」中以【仅报告】模式运行扫描。")
+        ttk.Label(info_frame, textvariable=self._results_info_var, wraplength=900).pack(side="left", fill="x", expand=True)
+
+        # --- Row 2: Toolbar buttons ---
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", pady=(0, 5))
+        ttk.Button(toolbar, text="刷新 / 加载报告", command=self._load_last_report).pack(side="left", padx=(0, 10))
+        ttk.Button(toolbar, text="全选", width=8, command=self._select_all_results).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="取消全选", width=8, command=self._deselect_all_results).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="反选", width=8, command=self._invert_selection_results).pack(side="left", padx=2)
+
+        # Separator
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        self._btn_delete_selected = ttk.Button(toolbar, text="删除选中项", command=self._delete_selected_results)
+        self._btn_delete_selected.pack(side="left", padx=2)
+
+        self._results_count_var = tk.StringVar(value="")
+        ttk.Label(toolbar, textvariable=self._results_count_var, foreground="gray").pack(side="right")
+
+        # --- Treeview with Scrollbar ---
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True)
+
+        # Create Treeview with style for row height
+        style = ttk.Style()
+        style.configure("Results.Treeview", rowheight=22)
+
+        self.results_tree = ttk.Treeview(tree_frame, show="headings", selectmode="extended", style="Results.Treeview")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.results_tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        # Placeholder columns — will be replaced when data loads
+        self.results_tree["columns"] = ("☑", "提示")
+        self.results_tree.heading("☑", text="☑", command=self._toggle_all_results)
+        self.results_tree.column("☑", width=30, minwidth=30, stretch=False, anchor="center")
+        self.results_tree.heading("提示", text="等待扫描结果...")
+        self.results_tree.column("提示", width=600, stretch=True)
+
+        # Click to toggle check
+        self.results_tree.bind("<Button-1>", self._on_results_tree_click)
+        # Double-click to toggle too
+        self.results_tree.bind("<Double-1>", self._on_results_tree_click)
+
+    # Column width presets based on data type
+    _COL_WIDTH_MAP = {
+        "☑": (30, False),
+        "UserPrincipalName": (200, False),
+        "Subject": (280, True),
+        "Sender": (160, False),
+        "Sender/Organizer": (160, False),
+        "Organizer": (160, False),
+        "Attendees": (200, True),
+        "Received": (140, False),
+        "Time": (140, False),
+        "Start": (140, False),
+        "End": (140, False),
+        "Action": (90, False),
+        "Status": (80, False),
+        "Type": (65, False),
+        "Details": (200, True),
+        "MessageId": (100, False),
+        "ItemId": (80, False),
+        "MeetingGOID": (80, False),
+        "CleanGOID": (80, False),
+        "iCalUId": (80, False),
+        "SeriesMasterId": (80, False),
+        "UserRole": (70, False),
+        "IsCancelled": (70, False),
+        "ResponseStatus": (90, False),
+        "RecurrencePattern": (100, False),
+        "PatternDetails": (120, True),
+        "RecurrenceDuration": (110, False),
+        "IsEndless": (65, False),
+    }
+
+    def _populate_results_tree(self, columns: list[str], rows: list[dict]):
+        """Fill the results Treeview with data."""
+        self._scan_results_columns = columns
+        self._scan_results_data = rows
+        self._scan_checked.clear()
+
+        # Clear old data
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+
+        # Setup columns: ☑ + data columns
+        display_cols = ["☑"] + columns
+        self.results_tree["columns"] = display_cols
+
+        # ☑ column
+        self.results_tree.heading("☑", text="☑", command=self._toggle_all_results)
+        self.results_tree.column("☑", width=30, minwidth=30, stretch=False, anchor="center")
+
+        # Data columns with smart widths
+        for col in columns:
+            self.results_tree.heading(col, text=col, command=lambda c=col: self._sort_results_by(c))
+            width, stretch = self._COL_WIDTH_MAP.get(col, (100, False))
+            self.results_tree.column(col, width=width, minwidth=40, stretch=stretch)
+
+        # Insert rows
+        for i, row in enumerate(rows):
+            vals = ["☐"] + [str(row.get(c, "") or "") for c in columns]
+            iid = self.results_tree.insert("", "end", iid=str(i), values=vals)
+            self._scan_checked[iid] = False
+
+        count = len(rows)
+        self._results_info_var.set(f"共 {count} 条结果。可勾选后点「删除选中项」进行删除。")
+        self._results_count_var.set(f"已选: 0 / {count}")
+
+    def _sort_results_by(self, col: str):
+        """Sort treeview rows by a column (toggle asc/desc)."""
+        try:
+            items = list(self.results_tree.get_children())
+            cols = list(self.results_tree["columns"])
+            ci = cols.index(col)
+
+            # Determine current sort direction
+            reverse = getattr(self, '_sort_reverse', False)
+            self._sort_reverse = not reverse
+
+            items.sort(key=lambda iid: str(self.results_tree.item(iid, "values")[ci]).lower(), reverse=self._sort_reverse)
+            for idx, iid in enumerate(items):
+                self.results_tree.move(iid, "", idx)
+        except Exception:
+            pass
+
+    def _on_results_tree_click(self, event):
+        """Toggle checkbox when user clicks on the ☑ column."""
+        region = self.results_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.results_tree.identify_column(event.x)
+        if col != "#1":  # First column is ☑
+            return
+        iid = self.results_tree.identify_row(event.y)
+        if not iid:
+            return
+        checked = self._scan_checked.get(iid, False)
+        self._scan_checked[iid] = not checked
+        vals = list(self.results_tree.item(iid, "values"))
+        vals[0] = "☑" if not checked else "☐"
+        self.results_tree.item(iid, values=vals)
+        self._update_selection_count()
+        return "break"
+
+    def _update_selection_count(self):
+        """Update the selected count label."""
+        total = len(self._scan_checked)
+        selected = sum(1 for v in self._scan_checked.values() if v)
+        self._results_count_var.set(f"已选: {selected} / {total}")
+
+    def _select_all_results(self):
+        for iid in self.results_tree.get_children():
+            self._scan_checked[iid] = True
+            vals = list(self.results_tree.item(iid, "values"))
+            vals[0] = "☑"
+            self.results_tree.item(iid, values=vals)
+        self._update_selection_count()
+
+    def _deselect_all_results(self):
+        for iid in self.results_tree.get_children():
+            self._scan_checked[iid] = False
+            vals = list(self.results_tree.item(iid, "values"))
+            vals[0] = "☐"
+            self.results_tree.item(iid, values=vals)
+        self._update_selection_count()
+
+    def _invert_selection_results(self):
+        for iid in self.results_tree.get_children():
+            checked = self._scan_checked.get(iid, False)
+            self._scan_checked[iid] = not checked
+            vals = list(self.results_tree.item(iid, "values"))
+            vals[0] = "☑" if not checked else "☐"
+            self.results_tree.item(iid, values=vals)
+        self._update_selection_count()
+
+    def _toggle_all_results(self):
+        """Toggle all: if any unchecked, select all; otherwise deselect all."""
+        any_unchecked = any(not v for v in self._scan_checked.values())
+        if any_unchecked:
+            self._select_all_results()
+        else:
+            self._deselect_all_results()
+
+    def _load_last_report(self):
+        """Load the most recent scan report CSV into the results Treeview."""
+        path = self._last_report_path
+        if not path or not os.path.exists(path):
+            # Try to find latest report in reports dir
+            try:
+                report_files = sorted(
+                    [f for f in os.listdir(self.reports_dir) if f.endswith('.csv')],
+                    key=lambda f: os.path.getmtime(os.path.join(self.reports_dir, f)),
+                    reverse=True,
+                )
+                if report_files:
+                    path = os.path.join(self.reports_dir, report_files[0])
+                else:
+                    messagebox.showinfo("提示", "未找到任何报告文件。请先运行扫描。")
+                    return
+            except Exception as e:
+                messagebox.showerror("错误", f"查找报告文件失败: {e}")
+                return
+
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                columns = reader.fieldnames or []
+                rows = list(reader)
+            self._last_report_path = path
+            self._populate_results_tree(columns, rows)
+            self.log(f">>> 已加载报告到扫描结果: {os.path.basename(path)} ({len(rows)} 条)")
+            self.notebook.select(self.tab_results)
+        except Exception as e:
+            messagebox.showerror("错误", f"加载报告失败: {e}")
+
+    def _delete_selected_results(self):
+        """Delete the checked items via Graph or EWS."""
+        selected_iids = [iid for iid, checked in self._scan_checked.items() if checked]
+        if not selected_iids:
+            messagebox.showinfo("提示", "未选中任何项目。请先勾选要删除的项目。")
+            return
+
+        count = len(selected_iids)
+        confirm = messagebox.askyesno("确认删除", f"即将删除 {count} 个选中项目。\n\n此操作不可撤销。是否继续？")
+        if not confirm:
+            return
+
+        source = self.source_type_var.get()
+        self._btn_delete_selected.configure(state="disabled")
+        threading.Thread(target=self._do_delete_selected, args=(selected_iids, source), daemon=True).start()
+
+    def _do_delete_selected(self, selected_iids: list[str], source: str):
+        """Background thread: delete selected items."""
+        total = len(selected_iids)
+        self.log(f">>> 开始删除 {total} 个选中项目 ({source})...")
+        success = 0
+        fail = 0
+
+        try:
+            if source == "Graph":
+                success, fail = self._do_delete_graph(selected_iids)
+            elif source == "EWS":
+                success, fail = self._do_delete_ews(selected_iids)
+        except Exception as e:
+            self.log(f"删除过程出错: {e}", "ERROR")
+        finally:
+            self.root.after(0, lambda: self._btn_delete_selected.configure(state="normal"))
+
+        self.log(f">>> 删除完成。成功: {success}, 失败: {fail}")
+        self._update_selection_count()
+        self.root.after(0, lambda s=success, f=fail: messagebox.showinfo("完成", f"删除完成。\n成功: {s}\n失败: {f}"))
+
+    def _do_delete_graph(self, selected_iids: list[str]) -> tuple[int, int]:
+        """Delete selected items via Graph API. Returns (success, fail)."""
+        auth_mode = self.graph_auth_mode_var.get()
+        tenant_id = self.tenant_id_var.get()
+        app_id = self.app_id_var.get()
+        thumbprint = self.thumbprint_var.get()
+        client_secret = self.client_secret_var.get()
+        env = self.graph_env_var.get()
+        token = self._get_graph_access_token(auth_mode, tenant_id, app_id, thumbprint, client_secret, env)
+        if not token:
+            self.log("无法获取 Graph 访问令牌。", "ERROR")
+            return 0, len(selected_iids)
+
+        graph_endpoint = "https://microsoftgraph.chinacloudapi.cn" if env == "China" else "https://graph.microsoft.com"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        success = 0
+        fail = 0
+        for i, iid in enumerate(selected_iids, 1):
+            try:
+                idx = int(iid)
+                row = self._scan_results_data[idx]
+                user = row.get("UserPrincipalName", "")
+                item_id = row.get("ItemId", "") or row.get("MessageId", "")
+                if not user or not item_id:
+                    self.log(f"  跳过第 {i} 项: 缺少 UserPrincipalName 或 ItemId", "ERROR")
+                    fail += 1
+                    continue
+
+                item_type = row.get("Type", "Email")
+                resource = "events" if item_type not in ("Email", "") else "messages"
+
+                del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
+                resp = requests.delete(del_url, headers=headers, timeout=30)
+                if resp.status_code in (200, 202, 204):
+                    success += 1
+                    self._update_result_row_status(iid, "Deleted", "success")
+                else:
+                    fail += 1
+                    self._update_result_row_status(iid, f"Failed ({resp.status_code})", "error")
+                    self.log(f"  删除失败 [{i}/{len(selected_iids)}]: {row.get('Subject', '?')} - HTTP {resp.status_code}", "ERROR")
+            except Exception as e:
+                fail += 1
+                self.log(f"  删除异常 [{i}/{len(selected_iids)}]: {e}", "ERROR")
+
+            if i % 10 == 0:
+                self.log(f"  进度: {i}/{len(selected_iids)}  (成功: {success}, 失败: {fail})")
+
+        return success, fail
+
+    def _do_delete_ews(self, selected_iids: list[str]) -> tuple[int, int]:
+        """Delete selected items via EWS. Returns (success, fail)."""
+        creds, token = self._get_ews_credentials()
+        if creds is None and token:
+            self.log("EWS Token 模式下暂不支持从扫描结果删除，请使用 NTLM/Basic/OAuth2 模式。", "ERROR")
+            return 0, len(selected_iids)
+
+        server = self._clean_server_address(self.ews_server_var.get())
+        use_auto = self.ews_use_autodiscover.get()
+        auth_type = self.ews_auth_type_var.get()
+        ews_auth_method = self.ews_auth_method_var.get()
+
+        ews_proto_auth_type = None
+        if ews_auth_method == "NTLM":
+            ews_proto_auth_type = NTLM
+        elif ews_auth_method == "Basic":
+            ews_proto_auth_type = BASIC
+
+        config = None
+        if not use_auto and creds is not None:
+            config_kwargs = {"server": server, "credentials": creds}
+            if ews_proto_auth_type:
+                config_kwargs["auth_type"] = ews_proto_auth_type
+            config = Configuration(**config_kwargs)
+
+        # Group by user for efficiency
+        user_items: dict[str, list[tuple[str, dict]]] = {}
+        for iid in selected_iids:
+            idx = int(iid)
+            row = self._scan_results_data[idx]
+            user = row.get("UserPrincipalName", "")
+            if user:
+                user_items.setdefault(user, []).append((iid, row))
+
+        access_type_val = IMPERSONATION if auth_type == "Impersonation" else DELEGATE
+        success = 0
+        fail = 0
+
+        for target_email, items_list in user_items.items():
+            try:
+                if use_auto:
+                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=access_type_val)
+                else:
+                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=access_type_val)
+
+                self.log(f"  已连接邮箱: {target_email} ({len(items_list)} 项待删除)")
+
+                # Collect EWS item IDs for bulk delete
+                batch_ids = []
+                batch_iids = []
+
+                for iid, row in items_list:
+                    msg_id = row.get("MessageId", "") or row.get("ItemId", "")
+                    if not msg_id:
+                        fail += 1
+                        self._update_result_row_status(iid, "No ID", "error")
+                        continue
+                    batch_ids.append(EwsItemId(id=msg_id))
+                    batch_iids.append(iid)
+
+                # Bulk delete in batches of 50
+                batch_size = 50
+                for bi in range(0, len(batch_ids), batch_size):
+                    chunk_ids = batch_ids[bi:bi + batch_size]
+                    chunk_iids = batch_iids[bi:bi + batch_size]
+                    try:
+                        account.bulk_delete(ids=chunk_ids, delete_type='MoveToDeletedItems')
+                        for ciid in chunk_iids:
+                            success += 1
+                            self._update_result_row_status(ciid, "Deleted", "success")
+                    except Exception as e:
+                        # Fallback: try one by one
+                        self.log(f"  批量删除失败，逐个重试: {e}", is_advanced=True)
+                        for eid, ciid in zip(chunk_ids, chunk_iids):
+                            try:
+                                account.bulk_delete(ids=[eid], delete_type='MoveToDeletedItems')
+                                success += 1
+                                self._update_result_row_status(ciid, "Deleted", "success")
+                            except Exception as ex2:
+                                fail += 1
+                                self._update_result_row_status(ciid, "Failed", "error")
+                                self.log(f"  EWS 删除失败: {ex2}", "ERROR")
+
+            except Exception as e:
+                fail += len(items_list)
+                self.log(f"  EWS 连接 {target_email} 失败: {e}", "ERROR")
+
+        return success, fail
+
+    def _update_result_row_status(self, iid: str, status_text: str, status_type: str):
+        """Update the Status column in the results Treeview for a given row."""
+        def _do():
+            try:
+                vals = list(self.results_tree.item(iid, "values"))
+                cols = list(self.results_tree["columns"])
+                if "Status" in cols:
+                    si = cols.index("Status")
+                    vals[si] = status_text
+                if status_type == "success":
+                    self._scan_checked[iid] = False
+                    vals[0] = "☐"
+                self.results_tree.item(iid, values=vals)
+            except Exception:
+                pass
+        self.root.after(0, _do)
+
     def update_ui_for_target(self):
         target = self.cleanup_target_var.get()
         if target == "Meeting":
-            self.meeting_opt_frame.pack(fill="x", pady=5, after=self.filter_frame) # Pack below filter or above? Let's put it above filter
             self.meeting_opt_frame.pack(fill="x", pady=5, before=self.filter_frame)
+
+            try:
+                self.permanent_delete_var.set(False)
+                self.chk_permanent_delete.configure(state="disabled")
+                self.soft_delete_var.set(False)
+                self.chk_soft_delete.configure(state="disabled")
+            except Exception:
+                pass
             
             self.lbl_subject.config(text="会议标题包含:")
             self.lbl_sender.config(text="组织者地址:")
@@ -1616,9 +2741,15 @@ class UniversalEmailCleanerApp:
             if hasattr(self, 'meeting_date_hint_label'):
                 self.meeting_date_hint_label.grid_remove()
 
+            try:
+                self.chk_permanent_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
+                self.chk_soft_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
+            except Exception:
+                pass
+
     def start_cleanup_thread(self):
-        if not self.csv_path_var.get():
-            messagebox.showerror("错误", "请选择 CSV 文件。")
+        if (not self.csv_path_var.get()) and (not (self.target_single_email_var.get() or '').strip()):
+            messagebox.showerror("错误", "请选择 CSV 文件，或填写单个目标邮箱地址。")
             return
         
         # Validation
@@ -1630,17 +2761,42 @@ class UniversalEmailCleanerApp:
                     messagebox.showwarning("配置缺失", "您选择了 Graph API (自动/证书) 模式，但未配置 App ID, Tenant ID 或 Thumbprint。\n请前往 '1. 连接配置' 标签页进行配置。")
                     self.notebook.select(self.tab_connection)
                     return
-            else: # Manual
+            elif mode == "Manual":
                 if not self.app_id_var.get() or not self.tenant_id_var.get() or not self.client_secret_var.get():
                     messagebox.showwarning("配置缺失", "您选择了 Graph API (手动/Secret) 模式，但未配置 App ID, Tenant ID 或 Client Secret。\n请前往 '1. 连接配置' 标签页进行配置。")
                     self.notebook.select(self.tab_connection)
                     return
+            else:  # Token
+                token_ui = (self.graph_token_var.get() or '').strip()
+                if token_ui.lower().startswith('bearer '):
+                    token_ui = token_ui[7:].strip()
+                cached = getattr(self, '_graph_token_protected_cache', '') or ''
+                if (not token_ui) and (not cached):
+                    messagebox.showwarning("配置缺失", "您选择了 Graph API (直接输入 Token) 模式，但未填写 Token，且未检测到已缓存 Token。\n请前往 '1. 连接配置' 标签页填写 Token。")
+                    self.notebook.select(self.tab_connection)
+                    return
 
         elif source == "EWS":
-            if not self.ews_user_var.get() or not self.ews_pass_var.get():
-                messagebox.showwarning("配置缺失", "您选择了 EWS 模式，但未配置用户名或密码。\n请前往 '1. 连接配置' 标签页进行配置。")
-                self.notebook.select(self.tab_connection)
-                return
+            ews_method = self.ews_auth_method_var.get()
+            if ews_method in ("Basic", "NTLM"):
+                if not self.ews_user_var.get() or not self.ews_pass_var.get():
+                    messagebox.showwarning("配置缺失", f"您选择了 EWS {ews_method} 模式，但未配置用户名或密码。\n请前往 '1. 连接配置' 标签页进行配置。")
+                    self.notebook.select(self.tab_connection)
+                    return
+            elif ews_method == "OAuth2":
+                if not self.ews_oauth_app_id_var.get() or not self.ews_oauth_tenant_id_var.get() or not self.ews_oauth_secret_var.get():
+                    messagebox.showwarning("配置缺失", "您选择了 EWS OAuth2 模式，但未配置 App ID, Tenant ID 或 Client Secret。\n请前往 '1. 连接配置' 标签页进行配置。")
+                    self.notebook.select(self.tab_connection)
+                    return
+            else:  # Token
+                token_ui = (self.ews_token_var.get() or '').strip()
+                if token_ui.lower().startswith('bearer '):
+                    token_ui = token_ui[7:].strip()
+                cached = getattr(self, '_ews_token_protected_cache', '') or ''
+                if (not token_ui) and (not cached):
+                    messagebox.showwarning("配置缺失", "您选择了 EWS Token 模式，但未填写 Token，且未检测到已缓存 Token。\n请前往 '1. 连接配置' 标签页填写 Token。")
+                    self.notebook.select(self.tab_connection)
+                    return
             if not self.ews_use_autodiscover.get() and not self.ews_server_var.get():
                 messagebox.showwarning("配置缺失", "您选择了 EWS 模式且未启用自动发现，但未配置服务器地址。\n请前往 '1. 连接配置' 标签页进行配置。")
                 self.notebook.select(self.tab_connection)
@@ -1665,7 +2821,28 @@ class UniversalEmailCleanerApp:
 
         # Double Confirmation for Deletion
         if not self.report_only_var.get():
-            confirm1 = messagebox.askyesno("高风险操作确认", "您当前处于【删除模式】！\n\n程序将 **永久删除** 匹配的邮件/会议，且 **无法恢复**。\n\n是否确认继续？")
+            if self.cleanup_target_var.get() == "Email" and self.permanent_delete_var.get():
+                msg = (
+                    "您当前处于【删除模式】并启用了【彻底删除(不可恢复)】！\n\n"
+                    "Graph 将尝试 permanentDelete（不进入 Recoverable Items）。\n"
+                    "EWS 将尽力使用更强删除类型（具体可恢复性取决于租户策略）。\n\n"
+                    "是否确认继续？"
+                )
+            elif self.cleanup_target_var.get() == "Email" and self.soft_delete_var.get():
+                msg = (
+                    "您当前处于【删除模式】并启用了【软删除(移动到 Deleted Items)】。\n\n"
+                    "Graph 将优先使用 move -> deleteditems；EWS 将尽力使用 MoveToDeletedItems。\n\n"
+                    "是否确认继续？"
+                )
+            else:
+                msg = (
+                    "您当前处于【删除模式】！\n\n"
+                    "此删除通常属于可恢复删除（可能进入 Recoverable Items）。\n"
+                    "如需不可恢复删除，请勾选【彻底删除】（仅 Email 生效）。\n\n"
+                    "是否确认继续？"
+                )
+
+            confirm1 = messagebox.askyesno("高风险操作确认", msg)
             if not confirm1:
                 return
             
@@ -1679,9 +2856,19 @@ class UniversalEmailCleanerApp:
         threading.Thread(target=self.run_cleanup, daemon=True).start()
 
     def run_cleanup(self):
+        # Reset progress bar
+        self._progress_reset(0)
         self.log("-" * 60)
         self.log(f"任务开始: {datetime.now()}")
-        self.log(f"模式: {'仅报告 (Report Only)' if self.report_only_var.get() else '删除 (DELETE)'}")
+        mode_str = '仅报告 (Report Only)' if self.report_only_var.get() else '删除 (DELETE)'
+        if not self.report_only_var.get() and self.cleanup_target_var.get() == 'Email':
+            if self.permanent_delete_var.get():
+                mode_str += ' | 彻底删除'
+            elif self.soft_delete_var.get():
+                mode_str += ' | 软删除(Deleted Items)'
+            else:
+                mode_str += ' | 可恢复删除'
+        self.log(f"模式: {mode_str}")
         self.log("-" * 60)
 
         source = self.source_type_var.get()
@@ -1707,6 +2894,162 @@ class UniversalEmailCleanerApp:
         if process.returncode != 0:
             raise Exception(f"PowerShell Error: {process.stderr}")
         return process.stdout.strip()
+
+    def _get_target_users(self):
+        single = (self.target_single_email_var.get() or '').strip()
+        if single:
+            if self.csv_path_var.get():
+                self.log("检测到单个目标邮箱已填写，将忽略 CSV 列表。", is_advanced=True)
+            return [single]
+
+        csv_path = self.csv_path_var.get()
+        if not csv_path:
+            return []
+
+        users = []
+        # Support both CSV (with UserPrincipalName header) and plain text (one email per line)
+        try:
+            with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                first_line = f.readline().strip()
+            if 'UserPrincipalName' in first_line:
+                # CSV with header
+                with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        key = next((k for k in row.keys() if 'UserPrincipalName' in k), None)
+                        if key and row.get(key):
+                            users.append(row[key].strip())
+            else:
+                # Plain text: one email per line
+                with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                    for line in f:
+                        email = line.strip()
+                        if email and '@' in email:
+                            users.append(email)
+        except Exception as e:
+            self.log(f"读取用户列表文件失败: {e}", "ERROR")
+        return users
+
+    def _import_mailbox_txt(self):
+        """Import a plain text file with one email per line, convert to CSV for use."""
+        txt_path = filedialog.askopenfilename(
+            title="选择邮箱列表文件",
+            filetypes=[
+                ("文本文件", "*.txt"),
+                ("CSV 文件", "*.csv"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not txt_path:
+            return
+
+        try:
+            with open(txt_path, 'r', encoding='utf-8-sig') as f:
+                first_line = f.readline().strip()
+
+            # If it's already a CSV with UserPrincipalName header, just set path
+            if 'UserPrincipalName' in first_line:
+                self.csv_path_var.set(txt_path)
+                self.log(f"已加载 CSV 邮箱列表: {txt_path}")
+                return
+
+            # Read emails from txt (one per line)
+            emails = []
+            with open(txt_path, 'r', encoding='utf-8-sig') as f:
+                for line in f:
+                    email = line.strip()
+                    if email and '@' in email:
+                        emails.append(email)
+
+            if not emails:
+                messagebox.showwarning("提示", "未在文件中找到有效的邮箱地址。\n\n格式要求：每行一个邮箱地址。")
+                return
+
+            # Convert to CSV in reports dir
+            csv_out = os.path.join(self.reports_dir, f"imported_mailbox_list_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            with open(csv_out, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(['UserPrincipalName'])
+                for email in emails:
+                    writer.writerow([email])
+
+            self.csv_path_var.set(csv_out)
+            self.log(f"已导入 {len(emails)} 个邮箱地址 (从 {os.path.basename(txt_path)} 转换为 CSV)")
+            messagebox.showinfo("导入成功", f"成功导入 {len(emails)} 个邮箱地址。")
+
+        except Exception as e:
+            messagebox.showerror("导入失败", f"读取文件失败: {e}")
+
+    # --- Progress Bar Helpers ---
+    def _progress_reset(self, total: int):
+        """Reset the progress bar for a new task."""
+        self._progress_total = total
+        self._progress_done = 0
+        def _do():
+            self.progress_bar["maximum"] = max(total, 1)
+            self.progress_bar["value"] = 0
+            self._progress_label_var.set(f"0 / {total} (0%)")
+        self.root.after(0, _do)
+
+    def _progress_increment(self, label: str = ""):
+        """Increment progress by one step."""
+        self._progress_done += 1
+        done = self._progress_done
+        total = self._progress_total
+        pct = int(done / max(total, 1) * 100)
+        def _do():
+            self.progress_bar["value"] = done
+            text = f"{done} / {total} ({pct}%)"
+            if label:
+                text += f"  {label}"
+            self._progress_label_var.set(text)
+        self.root.after(0, _do)
+
+    def _progress_finish(self, text: str = "完成"):
+        """Mark progress as complete."""
+        def _do():
+            self.progress_bar["value"] = self.progress_bar["maximum"]
+            self._progress_label_var.set(text)
+        self.root.after(0, _do)
+
+    def _get_graph_access_token(self, auth_mode, tenant_id, app_id, thumbprint, client_secret, env):
+        if auth_mode == "Token":
+            token_ui = (self.graph_token_var.get() or '').strip()
+            if token_ui.lower().startswith('bearer '):
+                token_ui = token_ui[7:].strip()
+
+            token = token_ui
+            from_cache = False
+            if not token:
+                protected = getattr(self, '_graph_token_protected_cache', '') or ''
+                if protected:
+                    token = _dpapi_unprotect_text(protected) or ''
+                    from_cache = True
+
+            if not token:
+                raise Exception("未提供 Token，且无法从缓存读取 Token")
+
+            # Refresh cache if enabled and token came from UI
+            try:
+                cache_enabled = bool(self.graph_cache_token_var.get())
+            except Exception:
+                cache_enabled = True
+
+            if cache_enabled and (not from_cache) and token:
+                protected_new = _dpapi_protect_text(token)
+                if protected_new:
+                    self._graph_token_protected_cache = protected_new
+                    try:
+                        # Persist best-effort
+                        self.save_config()
+                    except Exception:
+                        pass
+
+            return token
+
+        if auth_mode == "Auto":
+            return self.get_token_from_cert(tenant_id, app_id, thumbprint, env)
+        return self.get_token_from_secret(tenant_id, app_id, client_secret, env)
 
     def get_token_from_secret(self, tenant_id, client_id, client_secret, env):
         authority_host = "https://login.chinacloudapi.cn" if env == "China" else "https://login.microsoftonline.com"
@@ -1799,10 +3142,114 @@ class UniversalEmailCleanerApp:
         return self.run_powershell_script(script)
 
     def process_single_user_graph(self, user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
-                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None):
+                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None, mail_folder_scope: str | None = None, permanent_delete: bool = False, soft_delete: bool = False):
         self.log(f"--- 正在处理: {user} ---")
         try:
             req_headers = dict(headers)
+            session = _get_pooled_session()
+
+            def _graph_request(method: str, url: str, *, params: dict | None = None, json_body=None):
+                # Fast path: handle throttling/transient errors with limited retries.
+                # We keep this conservative to avoid making rate-limit worse.
+                max_attempts = 6
+                base_sleep = 0.6
+                for attempt in range(1, max_attempts + 1):
+                    resp = session.request(method, url, headers=req_headers, params=params, json=json_body)
+
+                    if resp.status_code in (429, 503, 502, 504):
+                        retry_after = resp.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                sleep_s = float(retry_after)
+                            except Exception:
+                                sleep_s = base_sleep * (2 ** (attempt - 1))
+                        else:
+                            sleep_s = base_sleep * (2 ** (attempt - 1))
+                        # jitter to spread concurrent threads
+                        sleep_s = min(12.0, sleep_s) + random.random() * 0.25
+                        if attempt < max_attempts:
+                            self.log(f"Graph 请求被限流/暂时失败({resp.status_code})，等待 {sleep_s:.2f}s 后重试...", is_advanced=True)
+                            time.sleep(sleep_s)
+                            continue
+                    return resp
+                return resp
+
+            def _graph_batch_send(batch_requests: list[dict]) -> dict | None:
+                # Graph $batch supports up to 20 requests
+                if not batch_requests:
+                    return None
+                batch_url = f"{graph_endpoint}/v1.0/$batch"
+                resp = _graph_request("POST", batch_url, json_body={"requests": batch_requests})
+                if resp.status_code != 200:
+                    return None
+                try:
+                    return resp.json()
+                except Exception:
+                    return None
+
+            def _to_batch_rel(full_url: str) -> str:
+                # Graph $batch expects relative urls starting with '/'
+                if full_url.startswith(graph_endpoint):
+                    rel = full_url[len(graph_endpoint):]
+                    return rel if rel.startswith('/') else '/' + rel
+                return full_url
+
+            def _infer_email_folder_mode() -> str:
+                s = (mail_folder_scope or "自动 (Auto)").strip().lower()
+                if "common" in s or "常用" in s:
+                    return "common"
+                if "sub" in s or "子文件夹" in s:
+                    return "inbox_subtree"
+                if "sent" in s or "已发送" in s:
+                    return "sent_only"
+                if "outbox" in s or "发件箱" in s:
+                    return "outbox_only"
+                if "recoverable" in s or "可恢复" in s:
+                    if "purge" in s or "清除" in s:
+                        return "recoverable_items_purges"
+                    return "recoverable_items_deletions"
+                if "deleted" in s or "已删除" in s:
+                    return "deleted_only"
+                if "junk" in s or "垃圾" in s:
+                    return "junk_only"
+                if "draft" in s or "草稿" in s:
+                    return "drafts_only"
+                if "archive" in s or "存档" in s:
+                    return "archive_only"
+                if "inbox" in s or "收件箱" in s:
+                    return "inbox_only"
+                if "all" in s or "全邮箱" in s:
+                    return "all"
+                return "auto"
+
+            def _graph_get_json(url: str, *, params: dict | None = None) -> dict:
+                graph_log_level = self.log_level_var.get()
+                if graph_log_level in ("Advanced", "Expert"):
+                    save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
+                    self.logger.log_to_file_only(f"GRAPH REQ: GET {url}")
+                    self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
+                    if params:
+                        self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
+                resp = _graph_request("GET", url, params=params)
+                if resp.status_code != 200:
+                    raise Exception(f"Graph folder query failed: {resp.status_code} {resp.text}")
+                return resp.json()
+
+            def _paged_folder_values(url: str, *, params: dict | None = None) -> list[dict]:
+                out: list[dict] = []
+                next_url = url
+                next_params = params
+                while next_url:
+                    data = _graph_get_json(next_url, params=next_params)
+                    out.extend(data.get('value', []) or [])
+                    next_url = data.get('@odata.nextLink')
+                    next_params = None
+                return out
+
+            email_folder_mode = _infer_email_folder_mode()
+            if target_type == "Email" and email_folder_mode == "auto":
+                # Preserve existing Graph behavior: mailbox-wide /messages
+                email_folder_mode = "all"
 
             # Meetings: prefer calendarView to expand recurrence into occurrence/exception within a date range
             if target_type == "Meeting" and resource == "calendarView":
@@ -1818,15 +3265,300 @@ class UniversalEmailCleanerApp:
                     "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
                 }
             else:
-                url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
-                if target_type == "Email":
-                    params = {"$top": 100, "$select": "id,subject,from,receivedDateTime,createdDateTime,body"}
-                else:
+                if target_type != "Email":
+                    url = f"{graph_endpoint}/v1.0/users/{user}/{resource}"
                     params = {
                         "$top": 100,
                         "$select": "id,subject,organizer,attendees,start,end,type,isCancelled,iCalUId,seriesMasterId,responseStatus,recurrence,bodyPreview",
                         "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
                     }
+                else:
+                    # Email: optionally restrict by folder scope
+                    base_resources: list[str]
+                    if email_folder_mode == "common":
+                        base_resources = [
+                            "mailFolders/inbox/messages",
+                            "mailFolders/outbox/messages",
+                            "mailFolders/sentitems/messages",
+                            "mailFolders/deleteditems/messages",
+                            "mailFolders/junkemail/messages",
+                            "mailFolders/drafts/messages",
+                            "mailFolders/archive/messages",
+                        ]
+                    elif email_folder_mode == "sent_only":
+                        base_resources = ["mailFolders/sentitems/messages"]
+                    elif email_folder_mode == "outbox_only":
+                        base_resources = ["mailFolders/outbox/messages"]
+                    elif email_folder_mode == "deleted_only":
+                        base_resources = ["mailFolders/deleteditems/messages"]
+                    elif email_folder_mode == "recoverable_items_deletions":
+                        base_resources = ["mailFolders/recoverableitemsdeletions/messages"]
+                    elif email_folder_mode == "recoverable_items_purges":
+                        base_resources = ["mailFolders/recoverableitemspurges/messages"]
+                    elif email_folder_mode == "junk_only":
+                        base_resources = ["mailFolders/junkemail/messages"]
+                    elif email_folder_mode == "drafts_only":
+                        base_resources = ["mailFolders/drafts/messages"]
+                    elif email_folder_mode == "archive_only":
+                        base_resources = ["mailFolders/archive/messages"]
+                    elif email_folder_mode in ("inbox_only", "inbox_subtree"):
+                        if email_folder_mode == "inbox_only":
+                            base_resources = ["mailFolders/inbox/messages"]
+                        else:
+                            try:
+                                inbox_meta = _graph_get_json(
+                                    f"{graph_endpoint}/v1.0/users/{user}/mailFolders/inbox",
+                                    params={"$select": "id,childFolderCount"},
+                                )
+                                inbox_id = inbox_meta.get('id')
+                                if not inbox_id:
+                                    raise Exception("Inbox id missing")
+                                folder_ids: list[str] = []
+                                q: list[str] = [inbox_id]
+                                while q:
+                                    fid = q.pop(0)
+                                    folder_ids.append(fid)
+                                    kids = _paged_folder_values(
+                                        f"{graph_endpoint}/v1.0/users/{user}/mailFolders/{fid}/childFolders",
+                                        params={"$top": 200, "$select": "id,childFolderCount"},
+                                    )
+                                    for k in kids:
+                                        kid = k.get('id')
+                                        if kid:
+                                            q.append(kid)
+                                base_resources = [f"mailFolders/{fid}/messages" for fid in folder_ids]
+                            except Exception as e:
+                                self.log(f"警告: 无法枚举 Inbox 子文件夹，回退为仅 Inbox。原因: {e}", level="ERROR")
+                                base_resources = ["mailFolders/inbox/messages"]
+                    else:
+                        base_resources = [resource]
+
+                    # Email listing can be chatty; reduce payload when body filter is not used.
+                    select_fields = "id,subject,from,receivedDateTime"
+                    if body_keyword:
+                        select_fields = "id,subject,from,receivedDateTime,body"
+                    params = {"$top": 500, "$select": select_fields}
+
+                    # Iterate each base resource separately (folder scope)
+                    for _res in base_resources:
+                        url = f"{graph_endpoint}/v1.0/users/{user}/{_res}"
+
+                        params2 = dict(params or {})
+                        if filter_str:
+                            params2["$filter"] = filter_str
+                        if body_keyword:
+                            params2["$search"] = f'"body:{body_keyword}"'
+                            req_headers["ConsistencyLevel"] = "eventual"
+
+                        next_url = url
+                        local_params = params2
+                        while next_url:
+                            graph_log_level = self.log_level_var.get()
+                            if graph_log_level in ("Advanced", "Expert"):
+                                save_auth = bool(graph_log_level == "Expert" and getattr(self, 'graph_save_auth_token_var', None) and self.graph_save_auth_token_var.get())
+                                self.logger.log_to_file_only(f"GRAPH REQ: GET {next_url}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
+                                if local_params:
+                                    self.logger.log_to_file_only(f"PARAMS: {json.dumps(local_params, default=str)}")
+
+                            self.log(f"请求: GET {next_url} | 参数: {local_params}", is_advanced=True)
+                            resp = _graph_request("GET", next_url, params=local_params if "users" in next_url and "?" not in next_url else None)
+
+                            if graph_log_level in ("Advanced", "Expert"):
+                                self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
+                                self.logger.log_to_file_only(f"HEADERS: {json.dumps(dict(resp.headers), default=str)}")
+                                body_text = resp.text or ""
+                                if graph_log_level == "Advanced":
+                                    body_text = body_text[:4096]
+                                else:
+                                    body_text = body_text[:50000]
+                                self.logger.log_to_file_only(f"BODY: {body_text}")
+
+                            if resp.status_code != 200:
+                                self.log(f"  X 查询失败: {resp.text}", "ERROR")
+                                self.log(f"响应: {resp.text}", is_advanced=True)
+                                with csv_lock:
+                                    writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
+                                break
+
+                            data = resp.json()
+                            items = data.get('value', [])
+
+                            if not items:
+                                self.log("  未找到匹配项。")
+                                break
+
+                            perm_enabled = bool(permanent_delete and target_type == "Email" and str(delete_resource).lower() == "messages")
+                            soft_enabled = bool((not perm_enabled) and (target_type == "Email") and bool(soft_delete) and str(delete_resource).lower() == "messages")
+
+                            delete_candidates: list[tuple[dict, str, str]] = []  # (row_data, item_id, del_url)
+                            for item in items:
+                                should_delete = True
+                                if body_keyword and "$search" not in (local_params or {}):
+                                    content = item.get('body', {}).get('content', '')
+                                    if body_keyword.lower() not in content.lower():
+                                        should_delete = False
+
+                                if should_delete:
+                                    item_id = item['id']
+                                    subject = item.get('subject', '无主题')
+                                    sender = item.get('from', {}).get('emailAddress', {}).get('address', '未知')
+                                    time_val = item.get('receivedDateTime')
+                                    item_type = "Email"
+
+                                    row_data = {
+                                        'UserPrincipalName': user,
+                                        'ItemId': item_id,
+                                        'Subject': subject,
+                                        'Sender/Organizer': sender,
+                                        'Time': time_val,
+                                        'Type': item_type,
+                                        'Action': 'ReportOnly' if report_only else ('PermanentDelete' if perm_enabled else ('SoftDelete' if soft_enabled else 'Delete')),
+                                        'Status': 'Pending',
+                                        'Details': ''
+                                    }
+
+                                    if report_only:
+                                        self.log(f"  [报告] 发现: {subject} ({item_type})")
+                                        row_data['Status'] = 'Skipped'
+                                        row_data['Details'] = '仅报告模式'
+                                    if report_only:
+                                        with csv_lock:
+                                            writer.writerow(row_data)
+                                    else:
+                                        del_url = f"{graph_endpoint}/v1.0/users/{user}/{delete_resource}/{item_id}"
+                                        delete_candidates.append((row_data, item_id, del_url))
+
+                            # If we are deleting, use Graph $batch (20 req per call)
+                            if (not report_only) and delete_candidates:
+                                # Chunk into batches of 20
+                                for i in range(0, len(delete_candidates), 20):
+                                    chunk = delete_candidates[i:i+20]
+                                    batch_requests = []
+                                    id_to_row = {}
+                                    id_to_delurl = {}
+                                    id_to_mode = {}
+                                    for j, (row_data, _item_id, del_url) in enumerate(chunk, start=1):
+                                        req_id = str(j)
+                                        id_to_row[req_id] = row_data
+                                        id_to_delurl[req_id] = del_url
+
+                                        if perm_enabled:
+                                            method = "POST"
+                                            url_rel = _to_batch_rel(f"{del_url}/permanentDelete")
+                                            id_to_mode[req_id] = "perm"
+                                        elif soft_enabled:
+                                            method = "POST"
+                                            url_rel = _to_batch_rel(f"{del_url}/move")
+                                            id_to_mode[req_id] = "soft"
+                                        else:
+                                            method = "DELETE"
+                                            url_rel = _to_batch_rel(del_url)
+                                            id_to_mode[req_id] = "delete"
+
+                                        req = {
+                                            "id": req_id,
+                                            "method": method,
+                                            "url": url_rel,
+                                            "headers": {"Content-Type": "application/json"},
+                                        }
+                                        if soft_enabled:
+                                            req["body"] = {"destinationId": "deleteditems"}
+                                        batch_requests.append(req)
+
+                                    batch_json = _graph_batch_send(batch_requests)
+                                    resp_map = {}
+                                    if batch_json and isinstance(batch_json, dict):
+                                        for r in (batch_json.get('responses') or []):
+                                            if isinstance(r, dict) and 'id' in r:
+                                                resp_map[str(r.get('id'))] = r
+
+                                    for req_id, row_data in id_to_row.items():
+                                        r = resp_map.get(req_id)
+                                        status = None
+                                        if r is not None:
+                                            status = r.get('status')
+
+                                        # If batch failed entirely, fall back to single-request
+                                        if status is None:
+                                            del_url = id_to_delurl.get(req_id)
+                                            mode = id_to_mode.get(req_id) or "delete"
+                                            self.log(f"  正在删除(回退): {row_data.get('Subject', '')}")
+                                            if mode == "perm":
+                                                del_resp = _graph_request("POST", f"{del_url}/permanentDelete")
+                                                ok_codes = (200, 201, 202, 204)
+                                            elif mode == "soft":
+                                                del_resp = _graph_request("POST", f"{del_url}/move", json_body={"destinationId": "deleteditems"})
+                                                ok_codes = (200, 201, 202, 204)
+                                            else:
+                                                del_resp = _graph_request("DELETE", del_url)
+                                                ok_codes = (202, 204)
+
+                                            if del_resp.status_code in ok_codes:
+                                                row_data['Status'] = 'Success'
+                                            else:
+                                                row_data['Status'] = 'Failed'
+                                                row_data['Details'] = f"状态码: {del_resp.status_code}"
+                                            with csv_lock:
+                                                writer.writerow(row_data)
+                                            continue
+
+                                        # permanentDelete may be unsupported; fall back
+                                        if perm_enabled and status in (404, 405):
+                                            del_url = id_to_delurl.get(req_id)
+                                            self.log("    ! permanentDelete 不可用，回退普通删除（可能进入 Recoverable Items）。", level="ERROR")
+                                            del_resp = _graph_request("DELETE", del_url)
+                                            if del_resp.status_code in (204, 202):
+                                                row_data['Status'] = 'Success'
+                                            else:
+                                                row_data['Status'] = 'Failed'
+                                                row_data['Details'] = f"状态码: {del_resp.status_code}"
+                                            with csv_lock:
+                                                writer.writerow(row_data)
+                                            continue
+
+                                        # move may be unsupported; fall back
+                                        if soft_enabled and status in (404, 405):
+                                            del_url = id_to_delurl.get(req_id)
+                                            self.log("    ! move 不可用，回退普通删除（可能进入 Recoverable Items）。", level="ERROR")
+                                            del_resp = _graph_request("DELETE", del_url)
+                                            if del_resp.status_code in (204, 202):
+                                                row_data['Status'] = 'Success'
+                                                row_data['Details'] = 'move 不可用，已回退 DELETE'
+                                            else:
+                                                row_data['Status'] = 'Failed'
+                                                row_data['Details'] = f"状态码: {del_resp.status_code}"
+                                            with csv_lock:
+                                                writer.writerow(row_data)
+                                            continue
+
+                                        if soft_enabled and status == 400:
+                                            try:
+                                                body = r.get('body') if isinstance(r, dict) else None
+                                                msg = ((body or {}).get('error') or {}).get('message') if isinstance(body, dict) else ''
+                                                msg = (msg or '').lower()
+                                                if 'destination' in msg and ('same' in msg or 'identical' in msg):
+                                                    row_data['Status'] = 'Success'
+                                                    row_data['Details'] = '已在 Deleted Items，无需移动'
+                                                    with csv_lock:
+                                                        writer.writerow(row_data)
+                                                    continue
+                                            except Exception:
+                                                pass
+
+                                        if status in (204, 202, 200, 201):
+                                            row_data['Status'] = 'Success'
+                                        else:
+                                            row_data['Status'] = 'Failed'
+                                            row_data['Details'] = f"状态码: {status}"
+                                        with csv_lock:
+                                            writer.writerow(row_data)
+
+                            next_url = data.get('@odata.nextLink')
+                            local_params = None
+
+                    # Email handled above; return to avoid running legacy single-resource path
+                    return
 
             if filter_str: params["$filter"] = filter_str
             
@@ -1844,7 +3576,7 @@ class UniversalEmailCleanerApp:
                         self.logger.log_to_file_only(f"PARAMS: {json.dumps(params, default=str)}")
 
                 self.log(f"请求: GET {url} | 参数: {params}", is_advanced=True)
-                resp = requests.get(url, headers=req_headers, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
+                resp = _graph_request("GET", url, params=params if "users" in url and "?" not in url else None) # Simple check to avoid double params
                 
                 if graph_log_level in ("Advanced", "Expert"):
                     self.logger.log_to_file_only(f"GRAPH RESP: {resp.status_code}")
@@ -1987,7 +3719,8 @@ class UniversalEmailCleanerApp:
                                         master_params = {
                                             "$select": "id,type,recurrence,iCalUId",
                                         }
-                                        m_resp = requests.get(master_url, headers=req_headers, params=master_params)
+                                        # Use pooled session + retry
+                                        m_resp = _graph_request("GET", master_url, params=master_params)
                                         if m_resp.status_code == 200:
                                             user_cache[series_master_id] = m_resp.json()
                                         else:
@@ -2033,7 +3766,7 @@ class UniversalEmailCleanerApp:
                                 self.logger.log_to_file_only(f"HEADERS: {json.dumps(redact_sensitive_headers(req_headers, save_authorization=save_auth), default=str)}")
 
                             self.log(f"请求: DELETE {del_url}", is_advanced=True)
-                            del_resp = requests.delete(del_url, headers=req_headers)
+                            del_resp = _graph_request("DELETE", del_url)
                             
                             if graph_log_level in ("Advanced", "Expert"):
                                 self.logger.log_to_file_only(f"GRAPH RESP: {del_resp.status_code}")
@@ -2080,28 +3813,17 @@ class UniversalEmailCleanerApp:
             graph_endpoint = "https://microsoftgraph.chinacloudapi.cn" if env == "China" else "https://graph.microsoft.com"
 
             self.log(">>> 正在获取 Access Token...")
-            
-            if auth_mode == "Auto":
-                token = self.get_token_from_cert(tenant_id, app_id, thumbprint, env)
-            else:
-                token = self.get_token_from_secret(tenant_id, app_id, client_secret, env)
+            token = self._get_graph_access_token(auth_mode, tenant_id, app_id, thumbprint, client_secret, env)
                 
             if not token: raise Exception("获取 Token 失败")
             
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
             self.log("√ Token 获取成功")
 
-            # Read CSV
-            users = []
-            with open(self.csv_path_var.get(), 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # 兼容带 BOM 或不带 BOM 的 key
-                    key = next((k for k in row.keys() if 'UserPrincipalName' in k), None)
-                    if key and row[key]:
-                        users.append(row[key].strip())
+            users = self._get_target_users()
             
             self.log(f">>> 找到 {len(users)} 个用户")
+            self._progress_reset(len(users))
 
             # Report File
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -2187,14 +3909,17 @@ class UniversalEmailCleanerApp:
 
                 csv_lock = threading.Lock()
                 report_only = self.report_only_var.get()
+                permanent_delete = bool(self.permanent_delete_var.get()) and (not report_only) and (target_type == "Email")
                 
                 with ThreadPoolExecutor(max_workers=10) as executor:
                     futures = []
+                    mail_folder_scope = self.mail_folder_scope_var.get()
+                    soft_delete = bool(self.soft_delete_var.get()) and (not report_only) and (target_type == "Email") and (not permanent_delete)
                     for user in users:
                         futures.append(executor.submit(
                             self.process_single_user_graph, 
                             user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
-                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end
+                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end, mail_folder_scope, permanent_delete, soft_delete
                         ))
                     
                     # Wait for all to complete
@@ -2203,11 +3928,15 @@ class UniversalEmailCleanerApp:
                             future.result()
                         except Exception as e:
                             self.log(f"Task Error: {e}", "ERROR")
+                        self._progress_increment()
 
+            self._progress_finish("Graph 任务完成")
             self.log(f">>> 任务完成! 报告: {report_path}")
             msg_title = "完成"
             if self.report_only_var.get():
                 msg_body = f"扫描生成报告任务完成。\n报告: {report_path}"
+                # Auto-load results into tab 3
+                self.root.after(100, self._load_last_report)
             else:
                 msg_body = f"清理任务已完成。\n报告: {report_path}"
                 
@@ -2222,22 +3951,41 @@ class UniversalEmailCleanerApp:
     def process_single_user_ews(self, target_email, creds, config, auth_type, use_auto, target_type, 
                                 start_date_str, end_date_str, criteria_sender, criteria_msg_id, 
                                 criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope, 
-                                report_only, writer, csv_lock, log_level):
+                                report_only, writer, csv_lock, log_level, mail_folder_scope: str | None = None, permanent_delete: bool = False, soft_delete: bool = False,
+                                access_token: str | None = None):
         try:
             self.log(f"--- 正在处理: {target_email} ---")
             
-            # Impersonation Setup
-            if auth_type == "Impersonation":
+            # Build Account — support Basic credentials or OAuth2/Token
+            access_type_val = IMPERSONATION if auth_type == "Impersonation" else DELEGATE
+
+            if creds is not None:
+                # Basic or OAuth2Credentials path
                 if use_auto:
-                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=IMPERSONATION)
+                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=access_type_val)
                 else:
-                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=IMPERSONATION)
+                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=access_type_val)
+            elif access_token:
+                # Token-only mode: inject bearer token via OAuth2AuthorizationCodeCredentials if available,
+                # otherwise use direct OAuth2Credentials wrapper
+                try:
+                    from exchangelib.credentials import OAuth2AuthorizationCodeCredentials
+                    token_creds = OAuth2AuthorizationCodeCredentials(access_token={'access_token': access_token, 'token_type': 'Bearer'})
+                except (ImportError, TypeError):
+                    if OAuth2Credentials is not None:
+                        token_creds = OAuth2Credentials(
+                            client_id='token-mode', client_secret='token-mode', tenant_id='token-mode',
+                            identity=None,
+                        )
+                    else:
+                        raise Exception("当前 exchangelib 版本不支持 OAuth2 Token 模式，请升级 exchangelib >= 4.7")
+                if use_auto:
+                    account = Account(primary_smtp_address=target_email, credentials=token_creds, autodiscover=True, access_type=access_type_val)
+                else:
+                    token_config = Configuration(server=config.server if config else 'outlook.office365.com', credentials=token_creds)
+                    account = Account(primary_smtp_address=target_email, config=token_config, autodiscover=False, access_type=access_type_val)
             else:
-                # Delegate / Direct
-                if use_auto:
-                    account = Account(primary_smtp_address=target_email, credentials=creds, autodiscover=True, access_type=DELEGATE)
-                else:
-                    account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=DELEGATE)
+                raise Exception(f"No credentials or token provided for {target_email}")
 
             self.log(f"已连接到邮箱: {target_email}", is_advanced=True)
 
@@ -2256,18 +4004,239 @@ class UniversalEmailCleanerApp:
             # Recurrence Cache
             recurrence_cache = {}
 
-            # Optimization: Set page size for faster retrieval
-            page_size = 100
+            # Optimization: Larger page size for fewer round-trips
+            page_size = 200
 
             if target_type == "Email":
-                qs = account.inbox.all().order_by('-datetime_received')
-                qs.page_size = page_size
-                if start_dt:
-                    qs = qs.filter(datetime_received__gte=start_dt)
-                if end_dt:
-                    qs = qs.filter(datetime_received__lt=end_dt)
-                if criteria_sender:
-                    qs = qs.filter(sender__icontains=criteria_sender)
+                def _infer_scope() -> str:
+                    s = (mail_folder_scope or "自动 (Auto)").strip().lower()
+                    if "common" in s or "常用" in s:
+                        return "common"
+                    if "sub" in s or "子文件夹" in s:
+                        return "inbox_subtree"
+                    if "sent" in s or "已发送" in s:
+                        return "sent_only"
+                    if "outbox" in s or "发件箱" in s:
+                        return "outbox_only"
+                    if "recoverable" in s or "可恢复" in s:
+                        if "purge" in s or "清除" in s:
+                            return "recoverable_items_purges"
+                        return "recoverable_items_deletions"
+                    if "deleted" in s or "已删除" in s:
+                        return "deleted_only"
+                    if "junk" in s or "垃圾" in s:
+                        return "junk_only"
+                    if "draft" in s or "草稿" in s:
+                        return "drafts_only"
+                    if "archive" in s or "存档" in s:
+                        return "archive_only"
+                    if "inbox" in s or "收件箱" in s:
+                        return "inbox_only"
+                    if "all" in s or "全邮箱" in s:
+                        return "all"
+                    return "auto"
+
+                scope = _infer_scope()
+                if scope == "auto":
+                    # Preserve existing EWS behavior
+                    scope = "inbox_only"
+
+                folders = []
+                try:
+                    if scope == "common":
+                        # Common set across mailboxes
+                        cand = []
+                        try:
+                            cand.append(account.inbox)
+                        except Exception:
+                            pass
+                        try:
+                            cand.append(getattr(account, "outbox"))
+                        except Exception:
+                            pass
+                        for attr in ("sent", "deleted_items", "junk", "drafts"):
+                            try:
+                                cand.append(getattr(account, attr))
+                            except Exception:
+                                pass
+                        # Archive is not guaranteed; try attribute then name-search
+                        try:
+                            cand.append(getattr(account, "archive"))
+                        except Exception:
+                            try:
+                                for f in account.root.walk():
+                                    if (getattr(f, 'name', '') or '').strip().lower() in ("archive", "存档"):
+                                        cand.append(f)
+                                        break
+                            except Exception:
+                                pass
+
+                        for f in cand:
+                            if f and hasattr(f, 'all'):
+                                folders.append(f)
+                    elif scope == "sent_only":
+                        folders = [getattr(account, "sent")]
+                    elif scope == "outbox_only":
+                        folders = [getattr(account, "outbox")]
+                    elif scope == "deleted_only":
+                        folders = [getattr(account, "deleted_items")]
+                    elif scope == "recoverable_items_deletions":
+                        folders = [getattr(account, "recoverable_items_deletions")]
+                    elif scope == "recoverable_items_purges":
+                        folders = [getattr(account, "recoverable_items_purges")]
+                    elif scope == "junk_only":
+                        folders = [getattr(account, "junk")]
+                    elif scope == "drafts_only":
+                        folders = [getattr(account, "drafts")]
+                    elif scope == "archive_only":
+                        try:
+                            folders = [getattr(account, "archive")]
+                        except Exception:
+                            found = None
+                            try:
+                                for f in account.root.walk():
+                                    if (getattr(f, 'name', '') or '').strip().lower() in ("archive", "存档"):
+                                        found = f
+                                        break
+                            except Exception:
+                                found = None
+                            folders = [found] if found else []
+                    elif scope == "all":
+                        for f in account.root.walk():
+                            cc = (getattr(f, 'container_class', '') or '')
+                            if cc and not str(cc).startswith('IPF.Note'):
+                                continue
+                            if hasattr(f, 'all'):
+                                folders.append(f)
+                    elif scope == "inbox_subtree":
+                        for f in account.inbox.walk():
+                            cc = (getattr(f, 'container_class', '') or '')
+                            if cc and not str(cc).startswith('IPF.Note'):
+                                continue
+                            if hasattr(f, 'all'):
+                                folders.append(f)
+                    else:
+                        folders = [account.inbox]
+                except Exception:
+                    folders = [account.inbox]
+
+                folders = [f for f in folders if f]
+
+                def _flush_delete_batch(folder, batch_items, batch_rows):
+                    if not batch_items:
+                        return
+
+                    dt = None
+                    if permanent_delete and (DeleteType is not None):
+                        dt = getattr(DeleteType, 'PURGE', None) or getattr(DeleteType, 'HARD_DELETE', None)
+                    elif (not permanent_delete) and soft_delete and (DeleteType is not None):
+                        dt = getattr(DeleteType, 'MOVE_TO_DELETED_ITEMS', None) or getattr(DeleteType, 'MOVE_TO_DELETEDITEMS', None)
+
+                    # Try bulk delete first (much faster)
+                    try:
+                        if hasattr(folder, 'bulk_delete'):
+                            ids = []
+                            for it in batch_items:
+                                iid = getattr(it, 'id', None)
+                                ck = getattr(it, 'changekey', None)
+                                if iid and ck:
+                                    ids.append((iid, ck))
+                                elif iid:
+                                    ids.append(iid)
+                            if ids:
+                                try:
+                                    if dt is not None:
+                                        folder.bulk_delete(ids, delete_type=dt)
+                                    else:
+                                        folder.bulk_delete(ids)
+                                except TypeError:
+                                    # Older exchangelib signatures
+                                    folder.bulk_delete(ids)
+
+                                for r in batch_rows:
+                                    r['Status'] = 'Success'
+                                    with csv_lock:
+                                        writer.writerow(r)
+                                return
+                    except Exception as e:
+                        self.log(f"  批量删除失败，回退逐个删除: {e}", "ERROR")
+
+                    # Fallback: per-item delete
+                    for it, r in zip(batch_items, batch_rows):
+                        try:
+                            if dt is not None:
+                                it.delete(delete_type=dt)
+                            else:
+                                it.delete()
+                            r['Status'] = 'Success'
+                        except Exception as e:
+                            r['Status'] = 'Failed'
+                            r['Details'] = ((r.get('Details') + '; ') if r.get('Details') else '') + str(e)
+                        with csv_lock:
+                            writer.writerow(r)
+
+                for folder in folders:
+                    batch_items = []
+                    batch_rows = []
+                    try:
+                        qs = folder.all().order_by('-datetime_received')
+                        qs.page_size = page_size
+                        if start_dt:
+                            qs = qs.filter(datetime_received__gte=start_dt)
+                        if end_dt:
+                            qs = qs.filter(datetime_received__lt=end_dt)
+                        if criteria_sender:
+                            qs = qs.filter(sender__icontains=criteria_sender)
+
+                        fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
+                        if criteria_body:
+                            fields.append('body')
+                        try:
+                            qs = qs.only(*fields)
+                        except Exception:
+                            pass
+
+                        for item in qs:
+                            if criteria_body:
+                                try:
+                                    if criteria_body.lower() not in (item.body or "").lower():
+                                        continue
+                                except Exception:
+                                    continue
+
+                            item_id = getattr(item, 'id', None) or (item.item_id if hasattr(item, 'item_id') else getattr(item, 'message_id', 'Unknown ID'))
+                            subject = item.subject
+                            sender_val = item.sender.email_address if item.sender else 'Unknown'
+                            received_val = getattr(item, 'datetime_received', 'Unknown')
+                            row = {
+                                'UserPrincipalName': target_email,
+                                'MessageId': item_id,
+                                'Subject': subject,
+                                'Sender': sender_val,
+                                'Received': received_val,
+                                'Action': 'Report' if report_only else ('PermanentDelete' if permanent_delete else ('SoftDelete' if soft_delete else 'Delete')),
+                                'Status': 'Pending',
+                                'Details': ''
+                            }
+
+                            if report_only:
+                                self.log(f"  [报告] 发现: {item.subject}")
+                                row['Status'] = 'Skipped'
+                                with csv_lock:
+                                    writer.writerow(row)
+                            else:
+                                batch_items.append(item)
+                                batch_rows.append(row)
+                                if len(batch_items) >= 200:
+                                    _flush_delete_batch(folder, batch_items, batch_rows)
+                                    batch_items = []
+                                    batch_rows = []
+
+                        if batch_items:
+                            _flush_delete_batch(folder, batch_items, batch_rows)
+                    except Exception as e:
+                        self.log(f"  文件夹扫描失败: {getattr(folder, 'name', '')} | {e}", "ERROR")
+
             else:
                 # Meeting Logic with CalendarView
                 if start_dt or end_dt:
@@ -2300,19 +4269,14 @@ class UniversalEmailCleanerApp:
             
             self.log(f"正在查询 EWS...", is_advanced=True)
             
-            # Optimization: Use only() to fetch required fields if possible, but CalendarView is tricky.
-            # For Email, we can optimize.
-            if target_type == "Email":
-                # We need: id, subject, sender, datetime_received, body (if filtered)
-                # Note: 'body' can be heavy. Only fetch if needed.
-                fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
-                if criteria_body:
-                    fields.append('body')
-                qs = qs.only(*fields)
-
-            items = list(qs) # Execute query
-            if not items:
-                self.log(f"用户 {target_email} 未找到项目。")
+            # Execute query for Meeting (Email already streamed above)
+            if target_type != "Email":
+                items = list(qs)
+                if not items:
+                    self.log(f"用户 {target_email} 未找到项目。")
+            else:
+                # Email already handled
+                return
             
             for item in items:
                 # Client Side Filters
@@ -2538,7 +4502,17 @@ class UniversalEmailCleanerApp:
                     row['Status'] = 'Skipped'
                 else:
                     self.log(f"  正在删除: {item.subject}")
-                    item.delete()
+                    if permanent_delete and (target_type == "Email") and (DeleteType is not None):
+                        try:
+                            dt = getattr(DeleteType, 'PURGE', None) or getattr(DeleteType, 'HARD_DELETE', None)
+                            if dt is not None:
+                                item.delete(delete_type=dt)
+                            else:
+                                item.delete()
+                        except Exception:
+                            item.delete()
+                    else:
+                        item.delete()
                     row['Status'] = 'Success'
                 
                 with csv_lock:
@@ -2609,30 +4583,36 @@ class UniversalEmailCleanerApp:
         try:
             self.log(">>> 开始 EWS 清理...")
             
-            # 1. Connect
-            user = self.ews_user_var.get()
-            pwd = self.ews_pass_var.get()
+            # 1. Connect — support NTLM / Basic / OAuth2 / Token
             server = self._clean_server_address(self.ews_server_var.get())
             use_auto = self.ews_use_autodiscover.get()
             auth_type = self.ews_auth_type_var.get()
+            ews_auth_method = self.ews_auth_method_var.get()
 
-            creds = Credentials(user, pwd)
+            creds, token = self._get_ews_credentials()
+
+            # Determine exchangelib auth_type constant for NTLM vs Basic
+            ews_proto_auth_type = None
+            if ews_auth_method == "NTLM":
+                ews_proto_auth_type = NTLM
+            elif ews_auth_method == "Basic":
+                ews_proto_auth_type = BASIC
+
             config = None
             if not use_auto:
                 self.log(f"Connecting to server: {server}")
-                config = Configuration(server=server, credentials=creds)
+                config_kwargs = {"server": server}
+                if creds is not None:
+                    config_kwargs["credentials"] = creds
+                if ews_proto_auth_type:
+                    config_kwargs["auth_type"] = ews_proto_auth_type
+                config = Configuration(**config_kwargs)
 
             # 2. Read CSV
-            users = []
-            with open(self.csv_path_var.get(), 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # 兼容带 BOM 或不带 BOM 的 key
-                    key = next((k for k in row.keys() if 'UserPrincipalName' in k), None)
-                    if key and row[key]:
-                        users.append(row[key].strip())
+            users = self._get_target_users()
             
-            self.log(f"在 CSV 中找到 {len(users)} 个用户。")
+            self.log(f"目标列表中共有 {len(users)} 个邮箱。")
+            self._progress_reset(len(users))
 
             # 3. Report File
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -2671,6 +4651,9 @@ class UniversalEmailCleanerApp:
                 meeting_scope = self.meeting_scope_var.get()
                 report_only = self.report_only_var.get()
                 log_level = self.log_level_var.get()
+                mail_folder_scope = self.mail_folder_scope_var.get()
+                permanent_delete = bool(self.permanent_delete_var.get()) and (not report_only) and (target_type == "Email")
+                soft_delete = bool(self.soft_delete_var.get()) and (not report_only) and (target_type == "Email") and (not permanent_delete)
                 
                 csv_lock = threading.Lock()
 
@@ -2682,7 +4665,8 @@ class UniversalEmailCleanerApp:
                             target_email, creds, config, auth_type, use_auto, target_type,
                             start_date_str, end_date_str, criteria_sender, criteria_msg_id,
                             criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope,
-                            report_only, writer, csv_lock, log_level
+                            report_only, writer, csv_lock, log_level, mail_folder_scope, permanent_delete, soft_delete,
+                            token
                         ))
                     
                     for future in futures:
@@ -2690,12 +4674,16 @@ class UniversalEmailCleanerApp:
                             future.result()
                         except Exception as e:
                             self.log(f"Task Error: {e}", "ERROR")
+                        self._progress_increment()
 
+            self._progress_finish("EWS 任务完成")
             self.log(f">>> 任务完成。报告: {report_path}")
             
             msg_title = "完成"
             if self.report_only_var.get():
                 msg_body = "扫描生成报告任务完成。"
+                # Auto-load results into tab 3
+                self.root.after(100, self._load_last_report)
             else:
                 msg_body = "清理任务已完成。"
                 
