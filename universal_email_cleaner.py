@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.11.1"
+APP_VERSION = "v1.11.2"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -146,11 +146,20 @@ def _win32_force_window_icon(hwnd: int, ico_path: str) -> None:
         ICON_SMALL = 0
         ICON_BIG = 1
 
-        hicon = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
-        if not hicon:
-            return
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+        # Navigate up to the real top-level window (Tk frame HWND is a child)
+        GA_ROOT = 2
+        real_hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+
+        hicon_big = user32.LoadImageW(None, ico_path, IMAGE_ICON, 48, 48, LR_LOADFROMFILE)
+        hicon_small = user32.LoadImageW(None, ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        if not hicon_big:
+            hicon_big = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if not hicon_small:
+            hicon_small = hicon_big
+        if hicon_big:
+            user32.SendMessageW(real_hwnd, WM_SETICON, ICON_BIG, hicon_big)
+        if hicon_small:
+            user32.SendMessageW(real_hwnd, WM_SETICON, ICON_SMALL, hicon_small)
     except Exception:
         pass
 
@@ -2352,33 +2361,31 @@ class UniversalEmailCleanerApp:
     # Column width presets based on data type
     _COL_WIDTH_MAP = {
         "☑": (30, False),
-        "UserPrincipalName": (200, False),
-        "Subject": (280, True),
-        "Sender": (160, False),
-        "Sender/Organizer": (160, False),
-        "Organizer": (160, False),
-        "Attendees": (200, True),
-        "Received": (140, False),
-        "Time": (140, False),
-        "Start": (140, False),
-        "End": (140, False),
-        "Action": (90, False),
-        "Status": (80, False),
-        "Type": (65, False),
-        "Details": (200, True),
-        "MessageId": (100, False),
-        "ItemId": (80, False),
-        "MeetingGOID": (80, False),
-        "CleanGOID": (80, False),
-        "iCalUId": (80, False),
-        "SeriesMasterId": (80, False),
-        "UserRole": (70, False),
-        "IsCancelled": (70, False),
-        "ResponseStatus": (90, False),
-        "RecurrencePattern": (100, False),
-        "PatternDetails": (120, True),
-        "RecurrenceDuration": (110, False),
-        "IsEndless": (65, False),
+        "UserPrincipalName": (220, False),
+        "Subject": (300, True),
+        "Sender": (180, False),
+        "Sender/Organizer": (180, False),
+        "Organizer": (180, False),
+        "Attendees": (220, True),
+        "Received": (150, False),
+        "Time": (150, False),
+        "Start": (150, False),
+        "End": (150, False),
+        "Type": (70, False),
+        "Details": (220, True),
+        "UserRole": (75, False),
+        "IsCancelled": (75, False),
+        "ResponseStatus": (100, False),
+        "RecurrencePattern": (110, False),
+        "PatternDetails": (130, True),
+        "RecurrenceDuration": (120, False),
+        "IsEndless": (70, False),
+    }
+
+    # Columns to hide from Treeview display (still kept in CSV)
+    _HIDDEN_COLS = {
+        "Action", "Status", "MessageId", "ItemId",
+        "MeetingGOID", "CleanGOID", "iCalUId", "SeriesMasterId",
     }
 
     def _populate_results_tree(self, columns: list[str], rows: list[dict]):
@@ -2391,8 +2398,11 @@ class UniversalEmailCleanerApp:
         for item in self.results_tree.get_children():
             self.results_tree.delete(item)
 
-        # Setup columns: ☑ + data columns
-        display_cols = ["☑"] + columns
+        # Filter out hidden columns for display
+        visible_cols = [c for c in columns if c not in self._HIDDEN_COLS]
+
+        # Setup columns: ☑ + visible data columns
+        display_cols = ["☑"] + visible_cols
         self.results_tree["columns"] = display_cols
 
         # ☑ column
@@ -2400,14 +2410,14 @@ class UniversalEmailCleanerApp:
         self.results_tree.column("☑", width=30, minwidth=30, stretch=False, anchor="center")
 
         # Data columns with smart widths
-        for col in columns:
+        for col in visible_cols:
             self.results_tree.heading(col, text=col, command=lambda c=col: self._sort_results_by(c))
-            width, stretch = self._COL_WIDTH_MAP.get(col, (100, False))
-            self.results_tree.column(col, width=width, minwidth=40, stretch=stretch)
+            width, stretch = self._COL_WIDTH_MAP.get(col, (120, False))
+            self.results_tree.column(col, width=width, minwidth=50, stretch=stretch)
 
-        # Insert rows
+        # Insert rows (only visible columns)
         for i, row in enumerate(rows):
-            vals = ["☐"] + [str(row.get(c, "") or "") for c in columns]
+            vals = ["☐"] + [str(row.get(c, "") or "") for c in visible_cols]
             iid = self.results_tree.insert("", "end", iid=str(i), values=vals)
             self._scan_checked[iid] = False
 
@@ -2699,18 +2709,29 @@ class UniversalEmailCleanerApp:
         return success, fail
 
     def _update_result_row_status(self, iid: str, status_text: str, status_type: str):
-        """Update the Status column in the results Treeview for a given row."""
+        """Update the row in the results Treeview after a delete action."""
         def _do():
             try:
                 vals = list(self.results_tree.item(iid, "values"))
                 cols = list(self.results_tree["columns"])
-                if "Status" in cols:
-                    si = cols.index("Status")
-                    vals[si] = status_text
+
+                # Update Details column with status if visible
+                if "Details" in cols:
+                    di = cols.index("Details")
+                    vals[di] = status_text
+
                 if status_type == "success":
                     self._scan_checked[iid] = False
                     vals[0] = "☐"
-                self.results_tree.item(iid, values=vals)
+                    self.results_tree.item(iid, values=vals, tags=("deleted",))
+                elif status_type == "error":
+                    self.results_tree.item(iid, values=vals, tags=("failed",))
+                else:
+                    self.results_tree.item(iid, values=vals)
+
+                # Apply tag colors
+                self.results_tree.tag_configure("deleted", foreground="gray")
+                self.results_tree.tag_configure("failed", foreground="red")
             except Exception:
                 pass
         self.root.after(0, _do)
