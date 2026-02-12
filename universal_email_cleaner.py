@@ -1283,25 +1283,16 @@ class UniversalEmailCleanerApp:
 
         ttk.Label(text_col, text=f"GitHub: {GITHUB_PROFILE_URL}").pack(anchor="w", pady=(6, 0))
 
-        # Load avatar from avatar_b64.txt (preferred) and show it if Pillow is available
-        def _try_load_avatar_b64():
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            candidates = [
-                os.path.join(base_dir, "avatar_b64.txt"),
-            ]
-            if getattr(sys, 'frozen', False):
-                candidates.append(os.path.join(sys._MEIPASS, "avatar_b64.txt"))
+        # Load avatar from avatar_b64.txt using resource_path (works for both dev and frozen exe)
+        avatar_b64 = None
+        try:
+            avatar_path = resource_path("avatar_b64.txt")
+            if os.path.exists(avatar_path):
+                with open(avatar_path, "r", encoding="utf-8") as f:
+                    avatar_b64 = f.read().strip()
+        except Exception:
+            pass
 
-            for p in candidates:
-                try:
-                    if os.path.exists(p):
-                        with open(p, "r", encoding="utf-8") as f:
-                            return f.read().strip()
-                except Exception:
-                    continue
-            return None
-
-        avatar_b64 = _try_load_avatar_b64()
         if avatar_b64 and Image is not None and ImageTk is not None:
             try:
                 raw = base64.b64decode(avatar_b64)
