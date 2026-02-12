@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.12.2"
+APP_VERSION = "v1.12.3"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -3707,6 +3707,18 @@ class UniversalEmailCleanerApp:
 
                 for item in items:
                     should_delete = True
+
+                    # Client-side type filtering for calendarView meetings
+                    if target_type == "Meeting" and resource == "calendarView":
+                        scope = self.meeting_scope_var.get()
+                        ev_type = item.get('type', '')
+                        if "Single" in scope:
+                            if ev_type != 'singleInstance':
+                                continue
+                        elif "Series" in scope:
+                            if ev_type not in ('seriesMaster', 'occurrence', 'exception'):
+                                continue
+
                     if body_keyword and "$search" not in params:
                         content = item.get('body', {}).get('content', '')
                         if body_keyword.lower() not in content.lower():
@@ -3772,6 +3784,7 @@ class UniversalEmailCleanerApp:
 
                             row_data = {
                                 'UserPrincipalName': user,
+                                'ItemId': item_id,
                                 'Subject': subject,
                                 'Type': item_type,
                                 'MeetingGOID': meeting_goid,
@@ -3938,7 +3951,7 @@ class UniversalEmailCleanerApp:
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 if target_type == "Meeting":
                     fieldnames = [
-                        'UserPrincipalName', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
+                        'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
                         'iCalUId', 'SeriesMasterId',
                         'Organizer', 'Attendees', 'Start', 'End', 'UserRole',
                         'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
@@ -3975,6 +3988,7 @@ class UniversalEmailCleanerApp:
                     else:
                         resource = "events"
                         delete_resource = "events"
+                        self.log("提示: 未指定日期范围，无法展开循环会议实例 (occurrence/exception)。建议设置起止日期。")
 
                     if self.criteria_sender.get():
                         filters.append(f"organizer/emailAddress/address eq '{self.criteria_sender.get()}'")
@@ -3990,15 +4004,17 @@ class UniversalEmailCleanerApp:
                         filters.append("isCancelled eq true")
                     
                     scope = self.meeting_scope_var.get()
-                    if "Single" in scope:
-                        filters.append("type eq 'singleInstance'")
-                    elif "Series" in scope:
-                        if resource == "calendarView":
-                            # Include expanded instances too (occurrence/exception) for EWS-like scan
-                            filters.append("type eq 'seriesMaster' or type eq 'occurrence' or type eq 'exception'")
-                        else:
+                    if resource == "calendarView":
+                        # calendarView returns occurrence/exception/singleInstance;
+                        # $filter on 'type' may be rejected — use client-side filtering.
+                        pass  # type filtering will be done client-side below
+                    else:
+                        # /events endpoint supports $filter on type
+                        if "Single" in scope:
+                            filters.append("type eq 'singleInstance'")
+                        elif "Series" in scope:
                             filters.append("type eq 'seriesMaster'")
-                    # If All, no type filter
+                        # If All, no type filter
 
                 filter_str = " and ".join(filters)
                 body_keyword = self.criteria_body.get()
@@ -4566,6 +4582,7 @@ class UniversalEmailCleanerApp:
 
                     row = {
                         'UserPrincipalName': target_email,
+                        'ItemId': item_id,
                         'Subject': subject,
                         'Type': m_type,
                         'MeetingGOID': m_goid,
@@ -4726,7 +4743,7 @@ class UniversalEmailCleanerApp:
             target_type = self.cleanup_target_var.get()
             if target_type == "Meeting":
                 fieldnames = [
-                    'UserPrincipalName', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID', 
+                    'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID', 
                     'Organizer', 'Attendees', 'Start', 'End', 'UserRole', 
                     'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
                     'Action', 'Status', 'Details'
