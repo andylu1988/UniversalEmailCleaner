@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.12.0"
+APP_VERSION = "v1.12.1"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -2309,11 +2309,11 @@ class UniversalEmailCleanerApp:
 
         # Delete mode indicator — synced from task config page
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
-        self._results_del_mode_var = tk.StringVar(value="普通删除")
+        self._results_del_mode_var = tk.StringVar(value="删除 (可恢复)")
         ttk.Label(toolbar, text="删除模式:").pack(side="left", padx=(0, 2))
         self._results_del_mode_cb = ttk.Combobox(
             toolbar, textvariable=self._results_del_mode_var,
-            values=["普通删除", "软删除 (移到已删除)", "彻底删除 (不可恢复)"],
+            values=["删除 (可恢复)", "移到已删除文件夹", "彻底删除 (不可恢复)"],
             state="readonly", width=20,
         )
         self._results_del_mode_cb.pack(side="left", padx=2)
@@ -2536,9 +2536,9 @@ class UniversalEmailCleanerApp:
             if self.permanent_delete_var.get():
                 self._results_del_mode_var.set("彻底删除 (不可恢复)")
             elif self.soft_delete_var.get():
-                self._results_del_mode_var.set("软删除 (移到已删除)")
+                self._results_del_mode_var.set("移到已删除文件夹")
             else:
-                self._results_del_mode_var.set("普通删除")
+                self._results_del_mode_var.set("删除 (可恢复)")
         except Exception:
             pass
 
@@ -2549,7 +2549,7 @@ class UniversalEmailCleanerApp:
             if mode == "彻底删除 (不可恢复)":
                 self.permanent_delete_var.set(True)
                 self.soft_delete_var.set(False)
-            elif mode == "软删除 (移到已删除)":
+            elif mode == "移到已删除文件夹":
                 self.permanent_delete_var.set(False)
                 self.soft_delete_var.set(True)
             else:
@@ -2577,11 +2577,11 @@ class UniversalEmailCleanerApp:
         mode = self._results_del_mode_var.get()
         warn = ""
         if "彻底" in mode:
-            warn = "\n\n⚠️ 当前为【彻底删除】模式，邮件将不可恢复！"
-        elif "软删" in mode:
-            warn = "\n\n当前为【软删除】模式，邮件将移至已删除文件夹。"
+            warn = "\n\n⚠️ 当前为【彻底删除】模式，邮件将永久删除，不可恢复！"
+        elif "已删除文件夹" in mode:
+            warn = "\n\n当前为【移到已删除文件夹】模式，邮件将移至 Deleted Items（用户可手动恢复）。"
         else:
-            warn = "\n\n当前为【普通删除】模式。"
+            warn = "\n\n当前为【删除(可恢复)】模式，邮件进入 Recoverable Items（管理员可通过 eDiscovery 恢复）。"
         confirm = messagebox.askyesno("确认删除", f"即将删除 {count} 个选中项目。{warn}\n\n是否继续？")
         if not confirm:
             return
@@ -2627,7 +2627,7 @@ class UniversalEmailCleanerApp:
         graph_endpoint = "https://microsoftgraph.chinacloudapi.cn" if env == "China" else "https://graph.microsoft.com"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         del_mode = self._get_delete_mode()
-        mode_label = {"permanent": "彻底删除", "soft": "软删除", "normal": "普通删除"}.get(del_mode, "普通删除")
+        mode_label = {"permanent": "彻底删除", "soft": "移到已删除文件夹", "normal": "删除(可恢复)"}.get(del_mode, "删除(可恢复)")
         self.log(f"  Graph 删除模式: {mode_label}")
 
         success = 0
@@ -2754,7 +2754,7 @@ class UniversalEmailCleanerApp:
                     ews_delete_type = 'MoveToDeletedItems'
                 else:
                     ews_delete_type = 'SoftDelete'
-                mode_label = {"permanent": "彻底删除", "soft": "软删除", "normal": "普通删除"}.get(del_mode, "普通删除")
+                mode_label = {"permanent": "彻底删除", "soft": "移到已删除文件夹", "normal": "删除(可恢复)"}.get(del_mode, "删除(可恢复)")
                 self.log(f"  EWS 删除模式: {mode_label} ({ews_delete_type})")
 
                 # Bulk delete in batches of 50
