@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.11.2"
+APP_VERSION = "v1.12.0"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -935,23 +935,15 @@ class UniversalEmailCleanerApp:
         except Exception:
             pass
 
-        try:
-            if Image is not None and ImageTk is not None:
-                ico_path = resource_path("graph-mail-delete.ico")
-                img = Image.open(ico_path).convert("RGBA")
-                img = img.resize((64, 64))
-                self._app_icon_photo = ImageTk.PhotoImage(img)
-                self.root.iconphoto(True, self._app_icon_photo)
-        except Exception:
-            pass
-
-        # Force taskbar icon (Win32) for stubborn Windows builds.
-        try:
-            if sys.platform == 'win32':
-                self.root.update_idletasks()
-                _win32_force_window_icon(int(self.root.winfo_id()), resource_path("graph-mail-delete.ico"))
-        except Exception:
-            pass
+        # Force taskbar icon (Win32) — defer to after window is fully mapped.
+        # Do NOT use iconphoto as it overrides iconbitmap and renders poorly in taskbar.
+        def _deferred_icon():
+            try:
+                if sys.platform == 'win32':
+                    _win32_force_window_icon(int(self.root.winfo_id()), resource_path("graph-mail-delete.ico"))
+            except Exception:
+                pass
+        self.root.after(200, _deferred_icon)
         
         # Auto-scale font based on DPI if possible, or just use a slightly larger default
         default_font_size = 10
@@ -2315,6 +2307,20 @@ class UniversalEmailCleanerApp:
         self._btn_delete_selected = ttk.Button(toolbar, text="删除选中项", command=self._delete_selected_results)
         self._btn_delete_selected.pack(side="left", padx=2)
 
+        # Delete mode indicator — synced from task config page
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
+        self._results_del_mode_var = tk.StringVar(value="普通删除")
+        ttk.Label(toolbar, text="删除模式:").pack(side="left", padx=(0, 2))
+        self._results_del_mode_cb = ttk.Combobox(
+            toolbar, textvariable=self._results_del_mode_var,
+            values=["普通删除", "软删除 (移到已删除)", "彻底删除 (不可恢复)"],
+            state="readonly", width=20,
+        )
+        self._results_del_mode_cb.pack(side="left", padx=2)
+        self._results_del_mode_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_del_mode_to_config())
+        # Initial sync from config vars
+        self.root.after(100, self._sync_del_mode_from_config)
+
         self._results_count_var = tk.StringVar(value="")
         ttk.Label(toolbar, textvariable=self._results_count_var, foreground="gray").pack(side="right")
 
@@ -2523,6 +2529,43 @@ class UniversalEmailCleanerApp:
         except Exception as e:
             messagebox.showerror("错误", f"加载报告失败: {e}")
 
+    # --- Delete mode sync helpers ---
+    def _sync_del_mode_from_config(self):
+        """Sync delete mode combobox from task config checkboxes."""
+        try:
+            if self.permanent_delete_var.get():
+                self._results_del_mode_var.set("彻底删除 (不可恢复)")
+            elif self.soft_delete_var.get():
+                self._results_del_mode_var.set("软删除 (移到已删除)")
+            else:
+                self._results_del_mode_var.set("普通删除")
+        except Exception:
+            pass
+
+    def _sync_del_mode_to_config(self):
+        """Sync task config checkboxes from results tab delete mode combobox."""
+        try:
+            mode = self._results_del_mode_var.get()
+            if mode == "彻底删除 (不可恢复)":
+                self.permanent_delete_var.set(True)
+                self.soft_delete_var.set(False)
+            elif mode == "软删除 (移到已删除)":
+                self.permanent_delete_var.set(False)
+                self.soft_delete_var.set(True)
+            else:
+                self.permanent_delete_var.set(False)
+                self.soft_delete_var.set(False)
+        except Exception:
+            pass
+
+    def _get_delete_mode(self) -> str:
+        """Return current delete mode: 'permanent', 'soft', or 'normal'."""
+        if self.permanent_delete_var.get():
+            return 'permanent'
+        elif self.soft_delete_var.get():
+            return 'soft'
+        return 'normal'
+
     def _delete_selected_results(self):
         """Delete the checked items via Graph or EWS."""
         selected_iids = [iid for iid, checked in self._scan_checked.items() if checked]
@@ -2531,7 +2574,15 @@ class UniversalEmailCleanerApp:
             return
 
         count = len(selected_iids)
-        confirm = messagebox.askyesno("确认删除", f"即将删除 {count} 个选中项目。\n\n此操作不可撤销。是否继续？")
+        mode = self._results_del_mode_var.get()
+        warn = ""
+        if "彻底" in mode:
+            warn = "\n\n⚠️ 当前为【彻底删除】模式，邮件将不可恢复！"
+        elif "软删" in mode:
+            warn = "\n\n当前为【软删除】模式，邮件将移至已删除文件夹。"
+        else:
+            warn = "\n\n当前为【普通删除】模式。"
+        confirm = messagebox.askyesno("确认删除", f"即将删除 {count} 个选中项目。{warn}\n\n是否继续？")
         if not confirm:
             return
 
@@ -2561,7 +2612,7 @@ class UniversalEmailCleanerApp:
         self.root.after(0, lambda s=success, f=fail: messagebox.showinfo("完成", f"删除完成。\n成功: {s}\n失败: {f}"))
 
     def _do_delete_graph(self, selected_iids: list[str]) -> tuple[int, int]:
-        """Delete selected items via Graph API. Returns (success, fail)."""
+        """Delete selected items via Graph API. Respects delete mode. Returns (success, fail)."""
         auth_mode = self.graph_auth_mode_var.get()
         tenant_id = self.tenant_id_var.get()
         app_id = self.app_id_var.get()
@@ -2575,6 +2626,9 @@ class UniversalEmailCleanerApp:
 
         graph_endpoint = "https://microsoftgraph.chinacloudapi.cn" if env == "China" else "https://graph.microsoft.com"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        del_mode = self._get_delete_mode()
+        mode_label = {"permanent": "彻底删除", "soft": "软删除", "normal": "普通删除"}.get(del_mode, "普通删除")
+        self.log(f"  Graph 删除模式: {mode_label}")
 
         success = 0
         fail = 0
@@ -2591,16 +2645,33 @@ class UniversalEmailCleanerApp:
 
                 item_type = row.get("Type", "Email")
                 resource = "events" if item_type not in ("Email", "") else "messages"
+                base_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
 
-                del_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
-                resp = requests.delete(del_url, headers=headers, timeout=30)
-                if resp.status_code in (200, 202, 204):
+                resp = None
+                if del_mode == "permanent" and resource == "messages":
+                    # POST .../permanentDelete
+                    resp = requests.post(f"{base_url}/permanentDelete", headers=headers, timeout=30)
+                    if resp.status_code in (404, 405):
+                        # Fallback to plain DELETE
+                        resp = requests.delete(base_url, headers=headers, timeout=30)
+                elif del_mode == "soft" and resource == "messages":
+                    # POST .../move to Deleted Items
+                    resp = requests.post(f"{base_url}/move", headers=headers, json={"destinationId": "deleteditems"}, timeout=30)
+                    if resp.status_code in (404, 405):
+                        resp = requests.delete(base_url, headers=headers, timeout=30)
+                else:
+                    # Normal delete (DELETE request — moves to Deleted Items by default)
+                    resp = requests.delete(base_url, headers=headers, timeout=30)
+
+                if resp is not None and resp.status_code in (200, 201, 202, 204):
                     success += 1
-                    self._update_result_row_status(iid, "Deleted", "success")
+                    status_txt = "PermanentDeleted" if del_mode == "permanent" else ("SoftDeleted" if del_mode == "soft" else "Deleted")
+                    self._update_result_row_status(iid, status_txt, "success")
                 else:
                     fail += 1
-                    self._update_result_row_status(iid, f"Failed ({resp.status_code})", "error")
-                    self.log(f"  删除失败 [{i}/{len(selected_iids)}]: {row.get('Subject', '?')} - HTTP {resp.status_code}", "ERROR")
+                    sc = resp.status_code if resp else "N/A"
+                    self._update_result_row_status(iid, f"Failed ({sc})", "error")
+                    self.log(f"  删除失败 [{i}/{len(selected_iids)}]: {row.get('Subject', '?')} - HTTP {sc}", "ERROR")
             except Exception as e:
                 fail += 1
                 self.log(f"  删除异常 [{i}/{len(selected_iids)}]: {e}", "ERROR")
@@ -2670,24 +2741,41 @@ class UniversalEmailCleanerApp:
                     batch_ids.append(EwsItemId(id=msg_id))
                     batch_iids.append(iid)
 
+                # Determine EWS delete type from user setting
+                del_mode = self._get_delete_mode()
+                ews_delete_type = 'MoveToDeletedItems'  # default
+                if del_mode == 'permanent':
+                    try:
+                        from exchangelib import DeleteType as _DT
+                        ews_delete_type = getattr(_DT, 'PURGE', None) or getattr(_DT, 'HARD_DELETE', None) or 'HardDelete'
+                    except Exception:
+                        ews_delete_type = 'HardDelete'
+                elif del_mode == 'soft':
+                    ews_delete_type = 'MoveToDeletedItems'
+                else:
+                    ews_delete_type = 'SoftDelete'
+                mode_label = {"permanent": "彻底删除", "soft": "软删除", "normal": "普通删除"}.get(del_mode, "普通删除")
+                self.log(f"  EWS 删除模式: {mode_label} ({ews_delete_type})")
+
                 # Bulk delete in batches of 50
                 batch_size = 50
+                status_txt = "PermanentDeleted" if del_mode == "permanent" else ("SoftDeleted" if del_mode == "soft" else "Deleted")
                 for bi in range(0, len(batch_ids), batch_size):
                     chunk_ids = batch_ids[bi:bi + batch_size]
                     chunk_iids = batch_iids[bi:bi + batch_size]
                     try:
-                        account.bulk_delete(ids=chunk_ids, delete_type='MoveToDeletedItems')
+                        account.bulk_delete(ids=chunk_ids, delete_type=ews_delete_type)
                         for ciid in chunk_iids:
                             success += 1
-                            self._update_result_row_status(ciid, "Deleted", "success")
+                            self._update_result_row_status(ciid, status_txt, "success")
                     except Exception as e:
                         # Fallback: try one by one
                         self.log(f"  批量删除失败，逐个重试: {e}", is_advanced=True)
                         for eid, ciid in zip(chunk_ids, chunk_iids):
                             try:
-                                account.bulk_delete(ids=[eid], delete_type='MoveToDeletedItems')
+                                account.bulk_delete(ids=[eid], delete_type=ews_delete_type)
                                 success += 1
-                                self._update_result_row_status(ciid, "Deleted", "success")
+                                self._update_result_row_status(ciid, status_txt, "success")
                             except Exception as ex2:
                                 fail += 1
                                 self._update_result_row_status(ciid, "Failed", "error")
