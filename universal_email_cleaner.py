@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.12.3"
+APP_VERSION = "v1.12.4"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -3708,15 +3708,35 @@ class UniversalEmailCleanerApp:
                 for item in items:
                     should_delete = True
 
-                    # Client-side type filtering for calendarView meetings
-                    if target_type == "Meeting" and resource == "calendarView":
-                        scope = self.meeting_scope_var.get()
-                        ev_type = item.get('type', '')
-                        if "Single" in scope:
-                            if ev_type != 'singleInstance':
+                    # Client-side filtering for meetings (Graph rejects combined $filter on events/calendarView)
+                    if target_type == "Meeting":
+                        # Type filter (calendarView only — /events does server-side)
+                        if resource == "calendarView":
+                            scope = self.meeting_scope_var.get()
+                            ev_type = item.get('type', '')
+                            if "Single" in scope:
+                                if ev_type != 'singleInstance':
+                                    continue
+                            elif "Series" in scope:
+                                if ev_type not in ('seriesMaster', 'occurrence', 'exception'):
+                                    continue
+
+                        # Subject filter (client-side for meetings)
+                        _cs = self.criteria_subject.get()
+                        if _cs:
+                            if _cs.lower() not in (item.get('subject') or '').lower():
                                 continue
-                        elif "Series" in scope:
-                            if ev_type not in ('seriesMaster', 'occurrence', 'exception'):
+
+                        # Organizer filter (client-side for meetings)
+                        _co = self.criteria_sender.get()
+                        if _co:
+                            org_addr = (item.get('organizer') or {}).get('emailAddress', {}).get('address', '')
+                            if _co.lower() != org_addr.lower():
+                                continue
+
+                        # IsCancelled filter (client-side for meetings)
+                        if self.meeting_only_cancelled_var.get():
+                            if not item.get('isCancelled'):
                                 continue
 
                     if body_keyword and "$search" not in params:
@@ -3965,8 +3985,9 @@ class UniversalEmailCleanerApp:
                 # Build Filter
                 filters = []
                 
-                # Common Filters
-                if self.criteria_subject.get(): filters.append(f"contains(subject, '{self.criteria_subject.get()}')")
+                # Common Filters — subject filter only for Email; meetings use client-side filtering
+                if self.criteria_subject.get() and target_type == "Email":
+                    filters.append(f"contains(subject, '{self.criteria_subject.get()}')")
                 
                 start_date = self.criteria_start_date.get().strip().replace('/', '-')
                 end_date = self.criteria_end_date.get().strip().replace('/', '-')
@@ -3990,8 +4011,8 @@ class UniversalEmailCleanerApp:
                         delete_resource = "events"
                         self.log("提示: 未指定日期范围，无法展开循环会议实例 (occurrence/exception)。建议设置起止日期。")
 
-                    if self.criteria_sender.get():
-                        filters.append(f"organizer/emailAddress/address eq '{self.criteria_sender.get()}'")
+                    # organizer / subject / isCancelled — Graph events/calendarView often rejects
+                    # combined $filter on these fields; use client-side filtering instead.
 
                     if resource == "events":
                         if start_date:
@@ -3999,10 +4020,7 @@ class UniversalEmailCleanerApp:
                         if end_date:
                             filters.append(f"end/dateTime le '{end_date}T23:59:59'")
                     
-                    # Meeting Specifics
-                    if self.meeting_only_cancelled_var.get():
-                        filters.append("isCancelled eq true")
-                    
+                    # Meeting Specifics — type filter
                     scope = self.meeting_scope_var.get()
                     if resource == "calendarView":
                         # calendarView returns occurrence/exception/singleInstance;
