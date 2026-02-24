@@ -21,7 +21,7 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
-APP_VERSION = "v1.12.4"
+APP_VERSION = "v1.12.5"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -194,6 +194,11 @@ EXCHANGELIB_ERROR = None
 try:
     from exchangelib import Account, Credentials, Configuration, DELEGATE, IMPERSONATION, Message, Mailbox, EWSDateTime, CalendarItem, NTLM, BASIC
     from exchangelib import ItemId as EwsItemId
+    try:
+        from exchangelib.version import Version, Build as EwsBuild
+    except ImportError:
+        Version = None
+        EwsBuild = None
     try:
         from exchangelib.items import DeleteType
     except Exception:
@@ -4744,6 +4749,11 @@ class UniversalEmailCleanerApp:
                     config_kwargs["credentials"] = creds
                 if ews_proto_auth_type:
                     config_kwargs["auth_type"] = ews_proto_auth_type
+                # For OAuth2 (app-only token), pre-set Exchange version to skip version
+                # probe request which fails because it lacks ExchangeImpersonation header.
+                if ews_auth_method == "OAuth2" and Version is not None and EwsBuild is not None:
+                    config_kwargs["version"] = Version(EwsBuild(15, 20))
+                    self.log("OAuth2 模式: 预设 Exchange 版本 (跳过版本探测)", is_advanced=True)
                 config = Configuration(**config_kwargs)
 
             # 2. Read CSV
