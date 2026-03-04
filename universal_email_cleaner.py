@@ -21,6 +21,15 @@ import io
 import random
 from requests.adapters import HTTPAdapter
 
+try:
+    from license_manager import (
+        check_license, activate_license, deactivate_license,
+        validate_license_key, DURATION_MAP,
+    )
+    _HAS_LICENSE = True
+except ImportError:
+    _HAS_LICENSE = False
+
 APP_VERSION = "v1.12.5"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
@@ -1034,6 +1043,17 @@ class UniversalEmailCleanerApp:
         )
         
         tools_menu.add_cascade(label="日志配置 (Log Level)", menu=log_menu)
+
+        # 许可证管理子菜单
+        if _HAS_LICENSE:
+            tools_menu.add_separator()
+            license_menu = tk.Menu(tools_menu, tearoff=0)
+            license_menu.add_command(label="查看许可证状态 (View License Status)", command=self.show_license_status)
+            license_menu.add_command(label="输入新密钥 (Enter New Key)", command=self.show_license_activation)
+            license_menu.add_separator()
+            license_menu.add_command(label="取消激活 (Deactivate)", command=self.do_deactivate_license)
+            tools_menu.add_cascade(label="许可证管理 (License)", menu=license_menu)
+
         menubar.add_cascade(label="工具 (Tools)", menu=tools_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -1241,6 +1261,47 @@ class UniversalEmailCleanerApp:
             txt.insert(tk.END, "未找到版本记录文件。")
             
         txt.config(state='disabled')
+
+    # ---- 许可证管理 UI ----
+
+    def show_license_status(self):
+        """显示当前许可证状态"""
+        if not _HAS_LICENSE:
+            messagebox.showinfo("许可证", "许可证模块未加载。")
+            return
+
+        status = check_license()
+        info = status.get('info')
+
+        if status['licensed'] and info:
+            expires_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '永久'
+            created_str = info['created'].strftime('%Y-%m-%d') if info['created'] else '未知'
+            msg = (
+                f"✅ 许可证状态: 已激活\n\n"
+                f"有效期类型: {info['duration_name']}\n"
+                f"创建日期: {created_str}\n"
+                f"到期日期: {expires_str}\n"
+            )
+            messagebox.showinfo("许可证状态 (License Status)", msg)
+        else:
+            err = status.get('error', '未知错误')
+            messagebox.showwarning("许可证状态 (License Status)", f"❌ {err}")
+
+    def show_license_activation(self):
+        """显示密钥输入窗口"""
+        _show_activation_dialog(self.root, on_success=lambda: self.log(">>> 许可证已激活。"))
+
+    def do_deactivate_license(self):
+        """取消激活许可证"""
+        if not _HAS_LICENSE:
+            return
+        confirm = messagebox.askyesno(
+            "确认取消激活",
+            "确定要取消激活当前许可证吗？\n\n取消后需要重新输入密钥才能继续使用。",
+        )
+        if confirm:
+            deactivate_license()
+            messagebox.showinfo("完成", "许可证已取消激活。\n应用将在下次启动时要求重新激活。")
 
     def show_about(self):
         about = tk.Toplevel(self.root)
@@ -4852,7 +4913,112 @@ class UniversalEmailCleanerApp:
             EwsTraceAdapter.logger = None
             EwsTraceAdapter.response_log_path = None
 
+def _show_activation_dialog(parent, on_success=None, allow_exit=True):
+    """显示许可证激活对话框。返回 True 表示激活成功。"""
+    if not _HAS_LICENSE:
+        return True
+
+    result = {'activated': False}
+
+    dlg = tk.Toplevel(parent)
+    dlg.title("许可证激活 (License Activation)")
+    dlg.geometry("580x340")
+    dlg.resizable(False, False)
+    dlg.transient(parent)
+    dlg.grab_set()
+    dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # 禁止直接关闭
+
+    try:
+        dlg.iconbitmap(resource_path("graph-mail-delete.ico"))
+    except Exception:
+        pass
+
+    frame = ttk.Frame(dlg, padding=20)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text="🔐 UniversalEmailCleaner 许可证激活",
+        font=("Segoe UI", 14, "bold"),
+    ).pack(pady=(0, 5))
+
+    ttk.Label(
+        frame,
+        text="请输入您的许可证密钥以激活应用程序。",
+    ).pack(pady=(0, 15))
+
+    ttk.Label(frame, text="许可证密钥 (License Key):").pack(anchor="w")
+
+    key_var = tk.StringVar()
+    key_entry = ttk.Entry(frame, textvariable=key_var, font=("Consolas", 12), width=55)
+    key_entry.pack(fill="x", pady=(5, 10))
+    key_entry.focus_set()
+
+    status_var = tk.StringVar(value="")
+    status_lbl = ttk.Label(frame, textvariable=status_var, wraplength=530)
+    status_lbl.pack(anchor="w", pady=(0, 15))
+
+    def do_activate():
+        key = key_var.get().strip()
+        if not key:
+            status_var.set("⚠️ 请输入许可证密钥。")
+            return
+
+        res = activate_license(key)
+        if res['success']:
+            info = res['info']
+            expires_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '永久'
+            status_var.set(f"✅ 激活成功！有效期: {info['duration_name']}，到期: {expires_str}")
+            result['activated'] = True
+            if on_success:
+                try:
+                    on_success()
+                except Exception:
+                    pass
+            dlg.after(1200, dlg.destroy)
+        else:
+            status_var.set(f"❌ 激活失败: {res['error']}")
+
+    def do_exit():
+        dlg.destroy()
+
+    btn_frame = ttk.Frame(frame)
+    btn_frame.pack(fill="x")
+
+    ttk.Button(
+        btn_frame,
+        text="激活 (Activate)",
+        command=do_activate,
+    ).pack(side="left", padx=(0, 10))
+
+    if allow_exit:
+        ttk.Button(
+            btn_frame,
+            text="退出 (Exit)",
+            command=do_exit,
+        ).pack(side="left")
+
+    # 绑定回车键
+    key_entry.bind("<Return>", lambda e: do_activate())
+
+    parent.wait_window(dlg)
+    return result['activated']
+
+
 if __name__ == "__main__":
     root = tk.Tk()
+
+    # ---- 许可证验证 ----
+    if _HAS_LICENSE:
+        license_status = check_license()
+        if not license_status['licensed']:
+            # 隐藏主窗口，先显示激活对话框
+            root.withdraw()
+            activated = _show_activation_dialog(root, allow_exit=True)
+            if not activated:
+                root.destroy()
+                sys.exit(0)
+            root.deiconify()
+
     app = UniversalEmailCleanerApp(root)
     root.mainloop()
