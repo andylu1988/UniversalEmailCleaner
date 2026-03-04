@@ -2436,6 +2436,7 @@ class UniversalEmailCleanerApp:
         "Start": (170, False),
         "End": (170, False),
         "Type": (80, False),
+        "MessageId": (280, True),
         "Details": (260, True),
         "UserRole": (85, False),
         "IsCancelled": (85, False),
@@ -2448,7 +2449,7 @@ class UniversalEmailCleanerApp:
 
     # Columns to hide from Treeview display (still kept in CSV)
     _HIDDEN_COLS = {
-        "Action", "Status", "MessageId", "ItemId",
+        "Action", "Status", "ItemId",
         "MeetingGOID", "CleanGOID", "iCalUId", "SeriesMasterId",
     }
 
@@ -4391,8 +4392,12 @@ class UniversalEmailCleanerApp:
                             qs = qs.filter(datetime_received__lt=end_dt)
                         if criteria_sender:
                             qs = qs.filter(sender__icontains=criteria_sender)
+                        if criteria_subject:
+                            qs = qs.filter(subject__icontains=criteria_subject)
+                        if criteria_msg_id:
+                            qs = qs.filter(message_id=criteria_msg_id)
 
-                        fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
+                        fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received', 'message_id']
                         if criteria_body:
                             fields.append('body')
                         try:
@@ -4409,12 +4414,14 @@ class UniversalEmailCleanerApp:
                                     continue
 
                             item_id = getattr(item, 'id', None) or (item.item_id if hasattr(item, 'item_id') else getattr(item, 'message_id', 'Unknown ID'))
+                            msg_id = getattr(item, 'message_id', '') or ''
                             subject = item.subject
                             sender_val = item.sender.email_address if item.sender else 'Unknown'
                             received_val = getattr(item, 'datetime_received', 'Unknown')
                             row = {
                                 'UserPrincipalName': target_email,
-                                'MessageId': item_id,
+                                'ItemId': item_id,
+                                'MessageId': msg_id,
                                 'Subject': subject,
                                 'Sender': sender_val,
                                 'Received': received_val,
