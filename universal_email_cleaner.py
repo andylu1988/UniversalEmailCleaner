@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.12.5"
+APP_VERSION = "v1.13.0"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -966,6 +966,7 @@ class UniversalEmailCleanerApp:
         style.theme_use('clam')
         style.configure('.', font=('Segoe UI', default_font_size))
         style.configure('Treeview', font=('Segoe UI', default_font_size))
+        style.configure('Treeview.Heading', font=('Segoe UI', default_font_size, 'bold'))
         style.configure('TButton', font=('Segoe UI', default_font_size))
         
         # --- Paths & Config ---
@@ -2396,7 +2397,7 @@ class UniversalEmailCleanerApp:
 
         # Create Treeview with style for row height
         style = ttk.Style()
-        style.configure("Results.Treeview", rowheight=22)
+        style.configure("Results.Treeview", rowheight=26)
 
         self.results_tree = ttk.Treeview(tree_frame, show="headings", selectmode="extended", style="Results.Treeview")
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.results_tree.yview)
@@ -2425,24 +2426,24 @@ class UniversalEmailCleanerApp:
     _COL_WIDTH_MAP = {
         "☑": (30, False),
         "UserPrincipalName": (220, False),
-        "Subject": (300, True),
-        "Sender": (180, False),
-        "Sender/Organizer": (180, False),
-        "Organizer": (180, False),
-        "Attendees": (220, True),
-        "Received": (150, False),
-        "Time": (150, False),
-        "Start": (150, False),
-        "End": (150, False),
-        "Type": (70, False),
-        "Details": (220, True),
-        "UserRole": (75, False),
-        "IsCancelled": (75, False),
-        "ResponseStatus": (100, False),
-        "RecurrencePattern": (110, False),
-        "PatternDetails": (130, True),
-        "RecurrenceDuration": (120, False),
-        "IsEndless": (70, False),
+        "Subject": (320, True),
+        "Sender": (200, False),
+        "Sender/Organizer": (200, False),
+        "Organizer": (200, False),
+        "Attendees": (240, True),
+        "Received": (170, False),
+        "Time": (170, False),
+        "Start": (170, False),
+        "End": (170, False),
+        "Type": (80, False),
+        "Details": (260, True),
+        "UserRole": (85, False),
+        "IsCancelled": (85, False),
+        "ResponseStatus": (110, False),
+        "RecurrencePattern": (120, False),
+        "PatternDetails": (140, True),
+        "RecurrenceDuration": (130, False),
+        "IsEndless": (80, False),
     }
 
     # Columns to hide from Treeview display (still kept in CSV)
