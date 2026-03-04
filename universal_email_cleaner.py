@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.13.0"
+APP_VERSION = "v1.13.1"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -4846,7 +4846,7 @@ class UniversalEmailCleanerApp:
                     'Action', 'Status', 'Details'
                 ]
             else:
-                fieldnames = ['UserPrincipalName', 'MessageId', 'Subject', 'Sender', 'Received', 'Action', 'Status', 'Details']
+                fieldnames = ['UserPrincipalName', 'ItemId', 'MessageId', 'Subject', 'Sender', 'Received', 'Action', 'Status', 'Details']
 
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
