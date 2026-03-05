@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.13.3"
+APP_VERSION = "v1.13.4"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -239,6 +239,38 @@ except ImportError as e:
     IMPERSONATION = None
     NTLM = "NTLM"
     BASIC = "basic"
+
+
+def _add_combobox_tooltip(widget, var):
+    """Add a hover tooltip to a Combobox that shows the full text of the current value."""
+    _tip = {'win': None}
+
+    def _show(event):
+        text = var.get()
+        if not text:
+            return
+        tw = tk.Toplevel(widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_attributes("-topmost", True)
+        x = event.x_root + 12
+        y = event.y_root + 16
+        tw.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tw, text=text, justify="left", background="#ffffe1",
+                    relief="solid", borderwidth=1, font=("Segoe UI", 10),
+                    wraplength=600, padx=6, pady=4)
+        lbl.pack()
+        _tip['win'] = tw
+
+    def _hide(_event=None):
+        tw = _tip.get('win')
+        if tw:
+            tw.destroy()
+            _tip['win'] = None
+
+    widget.bind("<Enter>", _show)
+    widget.bind("<Leave>", _hide)
+    widget.bind("<FocusOut>", _hide)
+
 
 class DateEntry(ttk.Frame):
     def __init__(self, master, textvariable, mode_var=None, other_date_var=None, **kwargs):
@@ -1126,7 +1158,7 @@ class UniversalEmailCleanerApp:
         # Keep existing behavior by default:
         # - Graph: All mailbox (messages)
         # - EWS: Inbox only
-        self.mail_folder_scope_var = tk.StringVar(value="自动 (Auto)")
+        self.mail_folder_scope_var = tk.StringVar(value="仅收件箱 (Inbox only)")
 
         # Progress tracking
         self._progress_total = 0
@@ -1440,7 +1472,11 @@ class UniversalEmailCleanerApp:
                     except Exception:
                         pass
                     try:
-                        self.mail_folder_scope_var.set(config.get('mail_folder_scope', '自动 (Auto)'))
+                        saved_scope = config.get('mail_folder_scope', '仅收件箱 (Inbox only)')
+                        # Migrate old "自动 (Auto)" to "仅收件箱 (Inbox only)"
+                        if "自动" in saved_scope or "Auto" in saved_scope:
+                            saved_scope = "仅收件箱 (Inbox only)"
+                        self.mail_folder_scope_var.set(saved_scope)
                     except Exception:
                         pass
                     try:
@@ -2320,7 +2356,6 @@ class UniversalEmailCleanerApp:
             opt_frame,
             textvariable=self.mail_folder_scope_var,
             values=[
-                "自动 (Auto)",
                 "仅收件箱 (Inbox only)",
                 "收件箱及子文件夹 (Inbox + Subfolders)",
                 "常用文件夹 (Common: Inbox/Outbox/Sent/Deleted/Junk/Drafts/Archive)",
@@ -2333,36 +2368,22 @@ class UniversalEmailCleanerApp:
                 "仅草稿 (Drafts only)",
                 "仅存档 (Archive only)",
                 "全邮箱 (All folders)",
+                "全邮箱-含 Dumpster (All folders + Recoverable Items)",
             ],
             state="readonly",
-            width=28,
+            width=40,
         )
         try:
-            if not (self.mail_folder_scope_var.get() or "").strip():
-                self.mail_folder_scope_var.set("自动 (Auto)")
+            val = (self.mail_folder_scope_var.get() or "").strip()
+            if not val or "自动" in val or "Auto" in val:
+                self.mail_folder_scope_var.set("仅收件箱 (Inbox only)")
         except Exception:
             pass
         self.mail_folder_scope_cb.pack(side="left", padx=5)
-        
-        ttk.Label(opt_frame, text="| 日志级别:").pack(side="left", padx=5)
-        
-        def on_log_level_click():
-            # Delegate to shared handler from Tools menu
-            val = self.log_level_var.get()
-            if val == "Expert":
-                confirm = messagebox.askyesno("警告", "日志排错专用，日志量会很大且包含敏感信息，慎选！\n\n确认开启专家模式吗？")
-                if not confirm:
-                    self.log_level_var.set("Normal")
-                    return
-            try:
-                self.logger.set_level(self.log_level_var.get())
-            except Exception:
-                pass
 
-        ttk.Radiobutton(opt_frame, text="默认 (Default)", variable=self.log_level_var, value="Normal", command=on_log_level_click).pack(side="left", padx=5)
-        ttk.Radiobutton(opt_frame, text="高级 (Advanced)", variable=self.log_level_var, value="Advanced", command=on_log_level_click).pack(side="left", padx=5)
-        ttk.Radiobutton(opt_frame, text="专家 (Expert)", variable=self.log_level_var, value="Expert", command=on_log_level_click).pack(side="left", padx=5)
-
+        # Tooltip for folder scope combobox
+        _add_combobox_tooltip(self.mail_folder_scope_cb, self.mail_folder_scope_var)
+        
         # Start
         ttk.Button(frame, textvariable=self.btn_start_text, command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
 
@@ -2454,6 +2475,7 @@ class UniversalEmailCleanerApp:
     _COL_WIDTH_MAP = {
         "☑": (30, False),
         "UserPrincipalName": (220, False),
+        "Folder": (160, False),
         "Subject": (320, True),
         "Sender": (200, False),
         "Sender/Organizer": (200, False),
@@ -3417,9 +3439,11 @@ class UniversalEmailCleanerApp:
                     return "archive_only"
                 if "inbox" in s or "收件箱" in s:
                     return "inbox_only"
-                if "all" in s or "全邮箱" in s:
+                if ("all" in s or "全邮箱" in s):
+                    if "dumpster" in s or "recoverable" in s or "含" in s:
+                        return "all_with_dumpster"
                     return "all"
-                return "auto"
+                return "inbox_only"
 
             def _graph_get_json(url: str, *, params: dict | None = None) -> dict:
                 graph_log_level = self.log_level_var.get()
@@ -3446,9 +3470,38 @@ class UniversalEmailCleanerApp:
                 return out
 
             email_folder_mode = _infer_email_folder_mode()
-            if target_type == "Email" and email_folder_mode == "auto":
-                # Preserve existing Graph behavior: mailbox-wide /messages
-                email_folder_mode = "all"
+
+            # Build a folder name cache for Graph (parentFolderId -> displayName)
+            _graph_folder_name_cache: dict[str, str] = {}
+
+            def _resolve_graph_folder_name(folder_id: str) -> str:
+                if not folder_id:
+                    return ""
+                if folder_id in _graph_folder_name_cache:
+                    return _graph_folder_name_cache[folder_id]
+                # Well-known folder ID patterns
+                well_known = {
+                    "inbox": "Inbox", "sentitems": "Sent Items", "drafts": "Drafts",
+                    "deleteditems": "Deleted Items", "junkemail": "Junk Email",
+                    "outbox": "Outbox", "archive": "Archive",
+                    "recoverableitemsdeletions": "Recoverable Items - Deletions",
+                    "recoverableitemspurges": "Recoverable Items - Purges",
+                }
+                for wk, name in well_known.items():
+                    if wk in folder_id.lower():
+                        _graph_folder_name_cache[folder_id] = name
+                        return name
+                try:
+                    data = _graph_get_json(
+                        f"{graph_endpoint}/v1.0/users/{user}/mailFolders/{folder_id}",
+                        params={"$select": "displayName"},
+                    )
+                    name = data.get("displayName", folder_id)
+                    _graph_folder_name_cache[folder_id] = name
+                    return name
+                except Exception:
+                    _graph_folder_name_cache[folder_id] = folder_id
+                    return folder_id
 
             # Meetings: prefer calendarView to expand recurrence into occurrence/exception within a date range
             if target_type == "Meeting" and resource == "calendarView":
@@ -3532,10 +3585,15 @@ class UniversalEmailCleanerApp:
                     else:
                         base_resources = [resource]
 
+                    # all_with_dumpster: append recoverable items folders
+                    if email_folder_mode == "all_with_dumpster":
+                        base_resources.append("mailFolders/recoverableitemsdeletions/messages")
+                        base_resources.append("mailFolders/recoverableitemspurges/messages")
+
                     # Email listing can be chatty; reduce payload when body filter is not used.
-                    select_fields = "id,subject,from,receivedDateTime"
+                    select_fields = "id,subject,from,receivedDateTime,parentFolderId"
                     if body_keyword:
-                        select_fields = "id,subject,from,receivedDateTime,body"
+                        select_fields = "id,subject,from,receivedDateTime,parentFolderId,body"
                     params = {"$top": 500, "$select": select_fields}
 
                     # Iterate each base resource separately (folder scope)
@@ -3604,10 +3662,12 @@ class UniversalEmailCleanerApp:
                                     sender = item.get('from', {}).get('emailAddress', {}).get('address', '未知')
                                     time_val = item.get('receivedDateTime')
                                     item_type = "Email"
+                                    folder_name = _resolve_graph_folder_name(item.get('parentFolderId', ''))
 
                                     row_data = {
                                         'UserPrincipalName': user,
                                         'ItemId': item_id,
+                                        'Folder': folder_name,
                                         'Subject': subject,
                                         'Sender/Organizer': sender,
                                         'Time': time_val,
@@ -4074,7 +4134,7 @@ class UniversalEmailCleanerApp:
                         'Action', 'Status', 'Details'
                     ]
                 else:
-                    fieldnames = ['UserPrincipalName', 'ItemId', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
+                    fieldnames = ['UserPrincipalName', 'ItemId', 'Folder', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
 
@@ -4265,14 +4325,13 @@ class UniversalEmailCleanerApp:
                         return "archive_only"
                     if "inbox" in s or "收件箱" in s:
                         return "inbox_only"
-                    if "all" in s or "全邮箱" in s:
+                    if ("all" in s or "全邮箱" in s):
+                        if "dumpster" in s or "recoverable" in s or "含" in s:
+                            return "all_with_dumpster"
                         return "all"
-                    return "auto"
+                    return "inbox_only"
 
                 scope = _infer_scope()
-                if scope == "auto":
-                    # Preserve existing EWS behavior
-                    scope = "inbox_only"
 
                 folders = []
                 try:
@@ -4334,13 +4393,22 @@ class UniversalEmailCleanerApp:
                             except Exception:
                                 found = None
                             folders = [found] if found else []
-                    elif scope == "all":
+                    elif scope in ("all", "all_with_dumpster"):
                         for f in account.root.walk():
                             cc = (getattr(f, 'container_class', '') or '')
                             if cc and not str(cc).startswith('IPF.Note'):
                                 continue
                             if hasattr(f, 'all'):
                                 folders.append(f)
+                        if scope == "all_with_dumpster":
+                            try:
+                                folders.append(getattr(account, "recoverable_items_deletions"))
+                            except Exception:
+                                pass
+                            try:
+                                folders.append(getattr(account, "recoverable_items_purges"))
+                            except Exception:
+                                pass
                     elif scope == "inbox_subtree":
                         for f in account.inbox.walk():
                             cc = (getattr(f, 'container_class', '') or '')
@@ -4446,10 +4514,12 @@ class UniversalEmailCleanerApp:
                             subject = item.subject
                             sender_val = item.sender.email_address if item.sender else 'Unknown'
                             received_val = getattr(item, 'datetime_received', 'Unknown')
+                            folder_name = getattr(folder, 'name', '') or ''
                             row = {
                                 'UserPrincipalName': target_email,
                                 'ItemId': item_id,
                                 'MessageId': msg_id,
+                                'Folder': folder_name,
                                 'Subject': subject,
                                 'Sender': sender_val,
                                 'Received': received_val,
@@ -4874,7 +4944,7 @@ class UniversalEmailCleanerApp:
                     'Action', 'Status', 'Details'
                 ]
             else:
-                fieldnames = ['UserPrincipalName', 'ItemId', 'MessageId', 'Subject', 'Sender', 'Received', 'Action', 'Status', 'Details']
+                fieldnames = ['UserPrincipalName', 'ItemId', 'MessageId', 'Folder', 'Subject', 'Sender', 'Received', 'Action', 'Status', 'Details']
 
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
