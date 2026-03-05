@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.13.2"
+APP_VERSION = "v1.13.3"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -941,8 +941,8 @@ class UniversalEmailCleanerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)")
-        self.root.geometry("1100x900")
-        self.root.minsize(900, 700)
+        self.root.geometry("1280x960")
+        self.root.minsize(1000, 750)
 
         # Improve Windows taskbar icon behavior by setting AppUserModelID
         # and explicitly setting a Tk iconphoto (some Windows builds ignore iconbitmap for taskbar).
@@ -1195,6 +1195,26 @@ class UniversalEmailCleanerApp:
                 
         self.btn_toggle_log = ttk.Button(log_toolbar, text="隐藏日志 (Hide Log)", command=toggle_log, width=20)
         self.btn_toggle_log.pack(side="right")
+
+        # 日志级别选择器 — 放在隐藏日志按钮左侧
+        ttk.Label(log_toolbar, text="日志级别:").pack(side="right", padx=(10, 2))
+        log_level_cb = ttk.Combobox(
+            log_toolbar,
+            textvariable=self.log_level_var,
+            values=["Normal", "Advanced", "Expert"],
+            state="readonly",
+            width=10,
+        )
+        log_level_cb.pack(side="right", padx=(0, 4))
+        log_level_cb.bind("<<ComboboxSelected>>", lambda _e: on_log_level_change_request())
+
+        # 清除日志显示按钮
+        def clear_log_display():
+            self.log_area.config(state='normal')
+            self.log_area.delete('1.0', tk.END)
+            self.log_area.config(state='disabled')
+
+        ttk.Button(log_toolbar, text="清除日志 (Clear)", command=clear_log_display, width=16).pack(side="right", padx=(0, 6))
 
         self.log_area = scrolledtext.ScrolledText(log_frame, height=12, state='disabled', font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
