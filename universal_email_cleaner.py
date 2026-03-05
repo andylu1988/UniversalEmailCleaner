@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.13.1"
+APP_VERSION = "v1.13.2"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -262,7 +262,7 @@ class DateEntry(ttk.Frame):
 
         self.top = tk.Toplevel(self)
         self.top.title("选择日期")
-        self.top.geometry("280x280")
+        self.top.resizable(False, False)
         self.top.grab_set()
 
         try:
@@ -392,7 +392,8 @@ class DateEntry(ttk.Frame):
             
         days = ["一", "二", "三", "四", "五", "六", "日"]
         for i, d in enumerate(days):
-            ttk.Label(frame, text=d, anchor="center").grid(row=0, column=i, sticky="nsew")
+            lbl = ttk.Label(frame, text=d, anchor="center", width=4)
+            lbl.grid(row=0, column=i, sticky="nsew", padx=1, pady=1)
             
         cal = calendar.monthcalendar(self.cal_year.get(), self.cal_month.get())
         
@@ -417,11 +418,18 @@ class DateEntry(ttk.Frame):
                             pass
 
                     btn = tk.Button(frame, text=str(day), relief="flat", state=state,
+                                    width=4, height=1,
                                     command=lambda d=day: self.select_date(d, top))
                     btn.grid(row=r+1, column=c, sticky="nsew", padx=1, pady=1)
         
         for i in range(7):
-            frame.columnconfigure(i, weight=1)
+            frame.columnconfigure(i, weight=1, minsize=36)
+        for i in range(len(cal) + 1):
+            frame.rowconfigure(i, weight=1, minsize=28)
+
+        # Auto-size popup window after layout
+        top.update_idletasks()
+        top.geometry("")
 
     def select_date(self, day, top):
         date_str = f"{self.cal_year.get()}-{self.cal_month.get():02d}-{day:02d}"
