@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.14.0"
+APP_VERSION = "v1.14.1"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -1333,11 +1333,20 @@ class UniversalEmailCleanerApp:
     def _get_selected_result_fields(self) -> list[str]:
         """Return list of selected result field keys."""
         if self.search_detail_var.get() == "lite":
-            return [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_lite]
+            selected = [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_lite]
         elif self.search_detail_var.get() == "custom":
-            return [k for k, v in self._result_field_selections.items() if v.get()]
+            selected = [k for k, v in self._result_field_selections.items() if v.get()]
         else:  # default = all
-            return [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_full]
+            selected = [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_full]
+
+        # Rule: if more than one folder is selected, Folder must be included.
+        try:
+            if len(self._get_selected_folders()) > 1 and 'Folder' not in selected:
+                selected.append('Folder')
+        except Exception:
+            pass
+
+        return selected
 
     def _show_folder_picker(self):
         """Show folder multi-select popup."""
@@ -1435,9 +1444,14 @@ class UniversalEmailCleanerApp:
         ttk.Label(frame, text="选择要在搜索结果中显示的字段:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 10))
         ttk.Label(frame, text="(Subject、Sender、Received 为基础字段，始终包含)", foreground="gray").pack(anchor="w", pady=(0, 10))
 
+        force_folder = len(self._get_selected_folders()) > 1
+        if force_folder:
+            self._result_field_selections['Folder'].set(True)
+            ttk.Label(frame, text="已选择多个文件夹，Folder 字段为必选。", foreground="#b36b00").pack(anchor="w", pady=(0, 8))
+
         for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
             base_fields = {"Subject", "Sender", "Received"}
-            state = "disabled" if key in base_fields else "normal"
+            state = "disabled" if (key in base_fields or (key == "Folder" and force_folder)) else "normal"
             ttk.Checkbutton(frame, text=label, variable=self._result_field_selections[key], state=state).pack(anchor="w", padx=10, pady=2)
 
         # Presets
@@ -1447,9 +1461,13 @@ class UniversalEmailCleanerApp:
         def preset_lite():
             for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
                 self._result_field_selections[key].set(is_lite)
+            if force_folder:
+                self._result_field_selections['Folder'].set(True)
         def preset_full():
             for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
                 self._result_field_selections[key].set(is_full)
+            if force_folder:
+                self._result_field_selections['Folder'].set(True)
 
         ttk.Button(preset_frame, text="轻量 (Lite)", command=preset_lite).pack(side="left", padx=5)
         ttk.Button(preset_frame, text="完整 (Full)", command=preset_full).pack(side="left", padx=5)
@@ -1481,6 +1499,12 @@ class UniversalEmailCleanerApp:
         """Open folder picker and update summary."""
         self._show_folder_picker()
         self._folder_summary_var.set(self._get_folder_summary_text())
+        # Enforce folder field when multiple folders selected
+        try:
+            if len(self._get_selected_folders()) > 1:
+                self._result_field_selections['Folder'].set(True)
+        except Exception:
+            pass
 
     def refresh_ews_config(self):
         if not self.ews_user_var.get() or not self.ews_pass_var.get():
