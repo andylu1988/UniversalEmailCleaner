@@ -30,7 +30,7 @@ try:
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.13.4"
+APP_VERSION = "v1.14.0"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -1154,11 +1154,17 @@ class UniversalEmailCleanerApp:
         self.criteria_end_date = tk.StringVar()
         self.criteria_item_class = tk.StringVar(value="IPM.Note")
 
-        # Email folder scan scope
-        # Keep existing behavior by default:
-        # - Graph: All mailbox (messages)
-        # - EWS: Inbox only
-        self.mail_folder_scope_var = tk.StringVar(value="仅收件箱 (Inbox only)")
+        # Email folder scan scope — multi-select dict {key: BooleanVar}
+        self._folder_selections: dict[str, tk.BooleanVar] = {}
+        self._init_folder_selections()
+
+        # Search detail level
+        self.search_detail_var = tk.StringVar(value="default")  # "lite" or "default" or "custom"
+        self._result_field_selections: dict[str, tk.BooleanVar] = {}
+        self._init_result_field_selections()
+
+        # Keep for backward compat with config
+        self.mail_folder_scope_var = tk.StringVar(value="")
 
         # Progress tracking
         self._progress_total = 0
@@ -1275,6 +1281,206 @@ class UniversalEmailCleanerApp:
         
         # Ensure UI state matches config
         self.toggle_connection_ui()
+
+    # ===================== Folder & Result Field Selection =====================
+
+    # Folder definitions: (key, display_label, category)
+    FOLDER_DEFS = [
+        # Common
+        ("inbox", "Inbox (收件箱)", "common"),
+        ("inbox_subtree", "Inbox + Subfolders (收件箱及子文件夹)", "common"),
+        ("sentitems", "Sent Items (已发送)", "common"),
+        ("outbox", "Outbox (发件箱)", "common"),
+        ("deleteditems", "Deleted Items (已删除)", "common"),
+        ("junkemail", "Junk Email (垃圾邮件)", "common"),
+        ("drafts", "Drafts (草稿)", "common"),
+        ("archive", "Archive (存档)", "common"),
+        # Dumpster / Hidden
+        ("recoverable_deletions", "Recoverable Items - Deletions (可恢复删除)", "dumpster"),
+        ("recoverable_purges", "Recoverable Items - Purges (可恢复清除)", "dumpster"),
+    ]
+
+    FOLDER_CATEGORIES = [
+        ("common", "常用文件夹 (Common Folders)"),
+        ("dumpster", "隐藏文件夹 / Dumpster (Recoverable Items)"),
+    ]
+
+    # Result field definitions: (key, display_label, is_default_lite, is_default_full)
+    RESULT_FIELD_DEFS = [
+        ("Folder", "Folder (文件夹)", False, True),
+        ("Subject", "Subject (主题)", True, True),
+        ("Sender", "Sender (发件人)", True, True),
+        ("Received", "Received (接收时间)", True, True),
+        ("HasAttachments", "HasAttachments (附件)", False, True),
+        ("Size", "Size (大小)", False, True),
+        ("MessageId", "MessageId (消息ID)", False, True),
+    ]
+
+    def _init_folder_selections(self):
+        """Initialize folder selection BooleanVars with defaults (Inbox selected)."""
+        for key, label, cat in self.FOLDER_DEFS:
+            self._folder_selections[key] = tk.BooleanVar(value=(key == "inbox"))
+
+    def _init_result_field_selections(self):
+        """Initialize result field selection BooleanVars."""
+        for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
+            self._result_field_selections[key] = tk.BooleanVar(value=is_full)
+
+    def _get_selected_folders(self) -> list[str]:
+        """Return list of selected folder keys."""
+        return [k for k, v in self._folder_selections.items() if v.get()]
+
+    def _get_selected_result_fields(self) -> list[str]:
+        """Return list of selected result field keys."""
+        if self.search_detail_var.get() == "lite":
+            return [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_lite]
+        elif self.search_detail_var.get() == "custom":
+            return [k for k, v in self._result_field_selections.items() if v.get()]
+        else:  # default = all
+            return [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_full]
+
+    def _show_folder_picker(self):
+        """Show folder multi-select popup."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("选择搜索文件夹 (Select Folders)")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        try:
+            dlg.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
+
+        frame = ttk.Frame(dlg, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        # Overall select/deselect
+        overall_frame = ttk.Frame(frame)
+        overall_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(overall_frame, text="全局操作:", font=("Segoe UI", 10, "bold")).pack(side="left")
+
+        def select_all():
+            for v in self._folder_selections.values():
+                v.set(True)
+        def deselect_all():
+            for v in self._folder_selections.values():
+                v.set(False)
+        def invert_all():
+            for v in self._folder_selections.values():
+                v.set(not v.get())
+
+        ttk.Button(overall_frame, text="全选", width=6, command=select_all).pack(side="left", padx=5)
+        ttk.Button(overall_frame, text="取消全选", width=8, command=deselect_all).pack(side="left", padx=2)
+        ttk.Button(overall_frame, text="反选", width=6, command=invert_all).pack(side="left", padx=2)
+
+        # Categories
+        for cat_key, cat_label in self.FOLDER_CATEGORIES:
+            cat_frame = ttk.LabelFrame(frame, text=f" {cat_label} ", padding=8)
+            cat_frame.pack(fill="x", pady=5)
+
+            # Category select/deselect
+            cat_btn_frame = ttk.Frame(cat_frame)
+            cat_btn_frame.pack(fill="x", pady=(0, 5))
+            cat_keys = [k for k, l, c in self.FOLDER_DEFS if c == cat_key]
+
+            def cat_select(keys=cat_keys):
+                for k in keys:
+                    self._folder_selections[k].set(True)
+            def cat_deselect(keys=cat_keys):
+                for k in keys:
+                    self._folder_selections[k].set(False)
+            def cat_invert(keys=cat_keys):
+                for k in keys:
+                    self._folder_selections[k].set(not self._folder_selections[k].get())
+
+            ttk.Button(cat_btn_frame, text="全选", width=6, command=cat_select).pack(side="left", padx=(0, 5))
+            ttk.Button(cat_btn_frame, text="取消", width=6, command=cat_deselect).pack(side="left", padx=(0, 5))
+            ttk.Button(cat_btn_frame, text="反选", width=6, command=cat_invert).pack(side="left")
+
+            # Checkboxes in 2 columns
+            chk_frame = ttk.Frame(cat_frame)
+            chk_frame.pack(fill="x")
+            items = [(k, l) for k, l, c in self.FOLDER_DEFS if c == cat_key]
+            for i, (key, label) in enumerate(items):
+                r, c = divmod(i, 2)
+                ttk.Checkbutton(chk_frame, text=label, variable=self._folder_selections[key]).grid(
+                    row=r, column=c, sticky="w", padx=5, pady=2)
+
+        # Close button
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_frame, text="确定 (OK)", command=dlg.destroy).pack(side="right")
+
+        # Center
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + 100
+        dlg.geometry(f"+{x}+{y}")
+
+    def _show_result_fields_picker(self):
+        """Show result field multi-select popup."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("选择搜索结果字段 (Select Result Fields)")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        try:
+            dlg.iconbitmap(resource_path("graph-mail-delete.ico"))
+        except Exception:
+            pass
+
+        frame = ttk.Frame(dlg, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="选择要在搜索结果中显示的字段:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(frame, text="(Subject、Sender、Received 为基础字段，始终包含)", foreground="gray").pack(anchor="w", pady=(0, 10))
+
+        for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
+            base_fields = {"Subject", "Sender", "Received"}
+            state = "disabled" if key in base_fields else "normal"
+            ttk.Checkbutton(frame, text=label, variable=self._result_field_selections[key], state=state).pack(anchor="w", padx=10, pady=2)
+
+        # Presets
+        preset_frame = ttk.Frame(frame)
+        preset_frame.pack(fill="x", pady=(10, 0))
+
+        def preset_lite():
+            for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
+                self._result_field_selections[key].set(is_lite)
+        def preset_full():
+            for key, label, is_lite, is_full in self.RESULT_FIELD_DEFS:
+                self._result_field_selections[key].set(is_full)
+
+        ttk.Button(preset_frame, text="轻量 (Lite)", command=preset_lite).pack(side="left", padx=5)
+        ttk.Button(preset_frame, text="完整 (Full)", command=preset_full).pack(side="left", padx=5)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_frame, text="确定 (OK)", command=dlg.destroy).pack(side="right")
+
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + 100
+        dlg.geometry(f"+{x}+{y}")
+
+    def _get_folder_summary_text(self) -> str:
+        """Return a short summary of selected folders for display."""
+        selected = self._get_selected_folders()
+        if not selected:
+            return "(未选择文件夹)"
+        names = []
+        for k, l, c in self.FOLDER_DEFS:
+            if k in selected:
+                short = l.split(" (")[0] if " (" in l else l
+                names.append(short)
+        if len(names) <= 3:
+            return ", ".join(names)
+        return f"{', '.join(names[:2])}... 共{len(names)}个"
+
+    def _on_folder_picker_click(self):
+        """Open folder picker and update summary."""
+        self._show_folder_picker()
+        self._folder_summary_var.set(self._get_folder_summary_text())
 
     def refresh_ews_config(self):
         if not self.ews_user_var.get() or not self.ews_pass_var.get():
@@ -1472,11 +1678,29 @@ class UniversalEmailCleanerApp:
                     except Exception:
                         pass
                     try:
-                        saved_scope = config.get('mail_folder_scope', '仅收件箱 (Inbox only)')
-                        # Migrate old "自动 (Auto)" to "仅收件箱 (Inbox only)"
-                        if "自动" in saved_scope or "Auto" in saved_scope:
-                            saved_scope = "仅收件箱 (Inbox only)"
-                        self.mail_folder_scope_var.set(saved_scope)
+                        # Load folder selections (new format)
+                        saved_folders = config.get('folder_selections', None)
+                        if saved_folders and isinstance(saved_folders, dict):
+                            for k, v in saved_folders.items():
+                                if k in self._folder_selections:
+                                    self._folder_selections[k].set(bool(v))
+                        # Update summary label
+                        try:
+                            self._folder_summary_var.set(self._get_folder_summary_text())
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    try:
+                        self.search_detail_var.set(config.get('search_detail', 'default'))
+                    except Exception:
+                        pass
+                    try:
+                        saved_fields = config.get('result_field_selections', None)
+                        if saved_fields and isinstance(saved_fields, dict):
+                            for k, v in saved_fields.items():
+                                if k in self._result_field_selections:
+                                    self._result_field_selections[k].set(bool(v))
                     except Exception:
                         pass
                     try:
@@ -1568,7 +1792,10 @@ class UniversalEmailCleanerApp:
             'source_type': self.source_type_var.get(),
             'csv_path': self.csv_path_var.get(),
             'target_single_email': self.target_single_email_var.get(),
-            'mail_folder_scope': self.mail_folder_scope_var.get(),
+            'mail_folder_scope': '',
+            'folder_selections': {k: bool(v.get()) for k, v in self._folder_selections.items()},
+            'search_detail': self.search_detail_var.get(),
+            'result_field_selections': {k: bool(v.get()) for k, v in self._result_field_selections.items()},
             'permanent_delete': bool(self.permanent_delete_var.get()),
             'soft_delete': bool(self.soft_delete_var.get()),
         }
@@ -2352,37 +2579,23 @@ class UniversalEmailCleanerApp:
             pass
 
         ttk.Label(opt_frame, text="| 文件夹范围(Email):").pack(side="left", padx=5)
-        self.mail_folder_scope_cb = ttk.Combobox(
-            opt_frame,
-            textvariable=self.mail_folder_scope_var,
-            values=[
-                "仅收件箱 (Inbox only)",
-                "收件箱及子文件夹 (Inbox + Subfolders)",
-                "常用文件夹 (Common: Inbox/Outbox/Sent/Deleted/Junk/Drafts/Archive)",
-                "仅已发送 (Sent Items only)",
-                "仅发件箱 (Outbox only)",
-                "仅已删除 (Deleted Items only)",
-                "仅可恢复删除 (Recoverable Items - Deletions)",
-                "仅可恢复清除 (Recoverable Items - Purges)",
-                "仅垃圾邮件 (Junk Email only)",
-                "仅草稿 (Drafts only)",
-                "仅存档 (Archive only)",
-                "全邮箱 (All folders)",
-                "全邮箱-含 Dumpster (All folders + Recoverable Items)",
-            ],
-            state="readonly",
-            width=40,
-        )
-        try:
-            val = (self.mail_folder_scope_var.get() or "").strip()
-            if not val or "自动" in val or "Auto" in val:
-                self.mail_folder_scope_var.set("仅收件箱 (Inbox only)")
-        except Exception:
-            pass
-        self.mail_folder_scope_cb.pack(side="left", padx=5)
 
-        # Tooltip for folder scope combobox
-        _add_combobox_tooltip(self.mail_folder_scope_cb, self.mail_folder_scope_var)
+        self._folder_summary_var = tk.StringVar(value=self._get_folder_summary_text())
+        ttk.Button(opt_frame, text="选择文件夹...", command=self._on_folder_picker_click, width=14).pack(side="left", padx=2)
+        self._folder_summary_lbl = ttk.Label(opt_frame, textvariable=self._folder_summary_var, foreground="gray", width=30)
+        self._folder_summary_lbl.pack(side="left", padx=2)
+        _add_combobox_tooltip(self._folder_summary_lbl, self._folder_summary_var)
+
+        # --- Row 3b: Search detail level ---
+        opt_frame2 = ttk.Frame(frame)
+        opt_frame2.pack(fill="x", pady=2)
+
+        ttk.Label(opt_frame2, text="搜索详细程度:").pack(side="left", padx=(0, 5))
+        ttk.Radiobutton(opt_frame2, text="轻量 (Lite)", variable=self.search_detail_var, value="lite").pack(side="left", padx=3)
+        ttk.Radiobutton(opt_frame2, text="默认-完整 (Default)", variable=self.search_detail_var, value="default").pack(side="left", padx=3)
+        ttk.Radiobutton(opt_frame2, text="自定义 (Custom)", variable=self.search_detail_var, value="custom").pack(side="left", padx=3)
+        ttk.Button(opt_frame2, text="自定义字段...", command=self._show_result_fields_picker, width=14).pack(side="left", padx=5)
+        ttk.Label(opt_frame2, text="(轻量模式仅搜基础字段，速度更快)", foreground="gray").pack(side="left", padx=5)
         
         # Start
         ttk.Button(frame, textvariable=self.btn_start_text, command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
@@ -2474,6 +2687,7 @@ class UniversalEmailCleanerApp:
     # Column width presets based on data type
     _COL_WIDTH_MAP = {
         "☑": (30, False),
+        "SMTPAddress": (230, False),
         "UserPrincipalName": (220, False),
         "Folder": (160, False),
         "Subject": (320, True),
@@ -2487,6 +2701,8 @@ class UniversalEmailCleanerApp:
         "End": (170, False),
         "Type": (80, False),
         "MessageId": (280, True),
+        "HasAttachments": (120, False),
+        "Size": (110, False),
         "Details": (260, True),
         "UserRole": (85, False),
         "IsCancelled": (85, False),
@@ -2505,6 +2721,11 @@ class UniversalEmailCleanerApp:
 
     def _populate_results_tree(self, columns: list[str], rows: list[dict]):
         """Fill the results Treeview with data."""
+        if 'SMTPAddress' in columns:
+            try:
+                rows = sorted(rows, key=lambda r: str(r.get('SMTPAddress', '') or '').lower())
+            except Exception:
+                pass
         self._scan_results_columns = columns
         self._scan_results_data = rows
         self._scan_checked.clear()
@@ -3363,7 +3584,9 @@ class UniversalEmailCleanerApp:
         return self.run_powershell_script(script)
 
     def process_single_user_graph(self, user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
-                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None, mail_folder_scope: str | None = None, permanent_delete: bool = False, soft_delete: bool = False):
+                                  report_only, writer, csv_lock, calendar_view_start=None, calendar_view_end=None,
+                                  selected_folders: list[str] | None = None, selected_result_fields: list[str] | None = None,
+                                  permanent_delete: bool = False, soft_delete: bool = False):
         self.log(f"--- 正在处理: {user} ---")
         try:
             req_headers = dict(headers)
@@ -3415,35 +3638,18 @@ class UniversalEmailCleanerApp:
                     return rel if rel.startswith('/') else '/' + rel
                 return full_url
 
-            def _infer_email_folder_mode() -> str:
-                s = (mail_folder_scope or "自动 (Auto)").strip().lower()
-                if "common" in s or "常用" in s:
-                    return "common"
-                if "sub" in s or "子文件夹" in s:
-                    return "inbox_subtree"
-                if "sent" in s or "已发送" in s:
-                    return "sent_only"
-                if "outbox" in s or "发件箱" in s:
-                    return "outbox_only"
-                if "recoverable" in s or "可恢复" in s:
-                    if "purge" in s or "清除" in s:
-                        return "recoverable_items_purges"
-                    return "recoverable_items_deletions"
-                if "deleted" in s or "已删除" in s:
-                    return "deleted_only"
-                if "junk" in s or "垃圾" in s:
-                    return "junk_only"
-                if "draft" in s or "草稿" in s:
-                    return "drafts_only"
-                if "archive" in s or "存档" in s:
-                    return "archive_only"
-                if "inbox" in s or "收件箱" in s:
-                    return "inbox_only"
-                if ("all" in s or "全邮箱" in s):
-                    if "dumpster" in s or "recoverable" in s or "含" in s:
-                        return "all_with_dumpster"
-                    return "all"
-                return "inbox_only"
+            # Map folder keys to Graph well-known folder resources
+            _GRAPH_FOLDER_MAP = {
+                "inbox": "mailFolders/inbox/messages",
+                "sentitems": "mailFolders/sentitems/messages",
+                "outbox": "mailFolders/outbox/messages",
+                "deleteditems": "mailFolders/deleteditems/messages",
+                "junkemail": "mailFolders/junkemail/messages",
+                "drafts": "mailFolders/drafts/messages",
+                "archive": "mailFolders/archive/messages",
+                "recoverable_deletions": "mailFolders/recoverableitemsdeletions/messages",
+                "recoverable_purges": "mailFolders/recoverableitemspurges/messages",
+            }
 
             def _graph_get_json(url: str, *, params: dict | None = None) -> dict:
                 graph_log_level = self.log_level_var.get()
@@ -3469,7 +3675,8 @@ class UniversalEmailCleanerApp:
                     next_params = None
                 return out
 
-            email_folder_mode = _infer_email_folder_mode()
+            selected_folder_keys = selected_folders if selected_folders else ["inbox"]
+            selected_result_fields_set = set(selected_result_fields or [])
 
             # Build a folder name cache for Graph (parentFolderId -> displayName)
             _graph_folder_name_cache: dict[str, str] = {}
@@ -3525,75 +3732,63 @@ class UniversalEmailCleanerApp:
                         "$expand": "singleValueExtendedProperties($filter=id eq 'Binary {6ED8DA90-450B-101B-98DA-00AA003F1305} Id 0x0003')",
                     }
                 else:
-                    # Email: optionally restrict by folder scope
-                    base_resources: list[str]
-                    if email_folder_mode == "common":
-                        base_resources = [
-                            "mailFolders/inbox/messages",
-                            "mailFolders/outbox/messages",
-                            "mailFolders/sentitems/messages",
-                            "mailFolders/deleteditems/messages",
-                            "mailFolders/junkemail/messages",
-                            "mailFolders/drafts/messages",
-                            "mailFolders/archive/messages",
-                        ]
-                    elif email_folder_mode == "sent_only":
-                        base_resources = ["mailFolders/sentitems/messages"]
-                    elif email_folder_mode == "outbox_only":
-                        base_resources = ["mailFolders/outbox/messages"]
-                    elif email_folder_mode == "deleted_only":
-                        base_resources = ["mailFolders/deleteditems/messages"]
-                    elif email_folder_mode == "recoverable_items_deletions":
-                        base_resources = ["mailFolders/recoverableitemsdeletions/messages"]
-                    elif email_folder_mode == "recoverable_items_purges":
-                        base_resources = ["mailFolders/recoverableitemspurges/messages"]
-                    elif email_folder_mode == "junk_only":
-                        base_resources = ["mailFolders/junkemail/messages"]
-                    elif email_folder_mode == "drafts_only":
-                        base_resources = ["mailFolders/drafts/messages"]
-                    elif email_folder_mode == "archive_only":
-                        base_resources = ["mailFolders/archive/messages"]
-                    elif email_folder_mode in ("inbox_only", "inbox_subtree"):
-                        if email_folder_mode == "inbox_only":
-                            base_resources = ["mailFolders/inbox/messages"]
-                        else:
-                            try:
-                                inbox_meta = _graph_get_json(
-                                    f"{graph_endpoint}/v1.0/users/{user}/mailFolders/inbox",
-                                    params={"$select": "id,childFolderCount"},
+                    # Email: build resources from multi-selected folders
+                    base_resources: list[str] = []
+                    include_inbox_subtree = False
+                    for fk in selected_folder_keys:
+                        if fk == "inbox_subtree":
+                            include_inbox_subtree = True
+                            continue
+                        mapped = _GRAPH_FOLDER_MAP.get(fk)
+                        if mapped:
+                            base_resources.append(mapped)
+
+                    if include_inbox_subtree:
+                        try:
+                            inbox_meta = _graph_get_json(
+                                f"{graph_endpoint}/v1.0/users/{user}/mailFolders/inbox",
+                                params={"$select": "id,childFolderCount"},
+                            )
+                            inbox_id = inbox_meta.get('id')
+                            if not inbox_id:
+                                raise Exception("Inbox id missing")
+                            folder_ids: list[str] = []
+                            q: list[str] = [inbox_id]
+                            while q:
+                                fid = q.pop(0)
+                                folder_ids.append(fid)
+                                kids = _paged_folder_values(
+                                    f"{graph_endpoint}/v1.0/users/{user}/mailFolders/{fid}/childFolders",
+                                    params={"$top": 200, "$select": "id,childFolderCount"},
                                 )
-                                inbox_id = inbox_meta.get('id')
-                                if not inbox_id:
-                                    raise Exception("Inbox id missing")
-                                folder_ids: list[str] = []
-                                q: list[str] = [inbox_id]
-                                while q:
-                                    fid = q.pop(0)
-                                    folder_ids.append(fid)
-                                    kids = _paged_folder_values(
-                                        f"{graph_endpoint}/v1.0/users/{user}/mailFolders/{fid}/childFolders",
-                                        params={"$top": 200, "$select": "id,childFolderCount"},
-                                    )
-                                    for k in kids:
-                                        kid = k.get('id')
-                                        if kid:
-                                            q.append(kid)
-                                base_resources = [f"mailFolders/{fid}/messages" for fid in folder_ids]
-                            except Exception as e:
-                                self.log(f"警告: 无法枚举 Inbox 子文件夹，回退为仅 Inbox。原因: {e}", level="ERROR")
-                                base_resources = ["mailFolders/inbox/messages"]
-                    else:
-                        base_resources = [resource]
+                                for k in kids:
+                                    kid = k.get('id')
+                                    if kid:
+                                        q.append(kid)
+                            base_resources.extend([f"mailFolders/{fid}/messages" for fid in folder_ids])
+                        except Exception as e:
+                            self.log(f"警告: 无法枚举 Inbox 子文件夹，回退为仅 Inbox。原因: {e}", level="ERROR")
+                            base_resources.append("mailFolders/inbox/messages")
 
-                    # all_with_dumpster: append recoverable items folders
-                    if email_folder_mode == "all_with_dumpster":
-                        base_resources.append("mailFolders/recoverableitemsdeletions/messages")
-                        base_resources.append("mailFolders/recoverableitemspurges/messages")
+                    # fallback if nothing selected
+                    if not base_resources:
+                        base_resources = ["mailFolders/inbox/messages"]
 
-                    # Email listing can be chatty; reduce payload when body filter is not used.
-                    select_fields = "id,subject,from,receivedDateTime,parentFolderId"
+                    # de-duplicate while preserving order
+                    _seen_res = set()
+                    base_resources = [r for r in base_resources if not (r in _seen_res or _seen_res.add(r))]
+
+                    # Email listing can be chatty; reduce payload when possible.
+                    select_parts = ["id", "subject", "from", "receivedDateTime", "parentFolderId"]
+                    if "HasAttachments" in selected_result_fields_set:
+                        select_parts.append("hasAttachments")
+                    if "Size" in selected_result_fields_set:
+                        select_parts.append("size")
+                    if "MessageId" in selected_result_fields_set:
+                        select_parts.append("internetMessageId")
                     if body_keyword:
-                        select_fields = "id,subject,from,receivedDateTime,parentFolderId,body"
+                        select_parts.append("body")
+                    select_fields = ",".join(select_parts)
                     params = {"$top": 500, "$select": select_fields}
 
                     # Iterate each base resource separately (folder scope)
@@ -3635,7 +3830,7 @@ class UniversalEmailCleanerApp:
                                 self.log(f"  X 查询失败: {resp.text}", "ERROR")
                                 self.log(f"响应: {resp.text}", is_advanced=True)
                                 with csv_lock:
-                                    writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
+                                    writer.writerow({'SMTPAddress': user, 'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
                                 break
 
                             data = resp.json()
@@ -3665,9 +3860,9 @@ class UniversalEmailCleanerApp:
                                     folder_name = _resolve_graph_folder_name(item.get('parentFolderId', ''))
 
                                     row_data = {
+                                        'SMTPAddress': user,
                                         'UserPrincipalName': user,
                                         'ItemId': item_id,
-                                        'Folder': folder_name,
                                         'Subject': subject,
                                         'Sender/Organizer': sender,
                                         'Time': time_val,
@@ -3676,6 +3871,15 @@ class UniversalEmailCleanerApp:
                                         'Status': 'Pending',
                                         'Details': ''
                                     }
+
+                                    if 'Folder' in selected_result_fields_set:
+                                        row_data['Folder'] = folder_name
+                                    if 'HasAttachments' in selected_result_fields_set:
+                                        row_data['HasAttachments'] = bool(item.get('hasAttachments', False))
+                                    if 'Size' in selected_result_fields_set:
+                                        row_data['Size'] = item.get('size', '')
+                                    if 'MessageId' in selected_result_fields_set:
+                                        row_data['MessageId'] = item.get('internetMessageId', '') or ''
 
                                     if report_only:
                                         self.log(f"  [报告] 发现: {subject} ({item_type})")
@@ -3851,7 +4055,7 @@ class UniversalEmailCleanerApp:
                     self.log(f"  X 查询失败: {resp.text}", "ERROR")
                     self.log(f"响应: {resp.text}", is_advanced=True)
                     with csv_lock:
-                        writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
+                        writer.writerow({'SMTPAddress': user, 'UserPrincipalName': user, 'Status': 'Error', 'Details': resp.text})
                     break
                 
                 data = resp.json()
@@ -3959,6 +4163,7 @@ class UniversalEmailCleanerApp:
                                 details_hint = f"GOID(b64)={goid_b64}; GOID(hex)={goid_hex}".strip('; ')
 
                             row_data = {
+                                'SMTPAddress': user,
                                 'UserPrincipalName': user,
                                 'ItemId': item_id,
                                 'Subject': subject,
@@ -4032,7 +4237,9 @@ class UniversalEmailCleanerApp:
                                 pass
 
                         if target_type == "Email":
+                            _selected_set = set(selected_result_fields or [])
                             row_data = {
+                                'SMTPAddress': user,
                                 'UserPrincipalName': user,
                                 'ItemId': item_id,
                                 'Subject': subject,
@@ -4043,6 +4250,14 @@ class UniversalEmailCleanerApp:
                                 'Status': 'Pending',
                                 'Details': ''
                             }
+                            if 'Folder' in _selected_set:
+                                row_data['Folder'] = _resolve_graph_folder_name(item.get('parentFolderId', ''))
+                            if 'HasAttachments' in _selected_set:
+                                row_data['HasAttachments'] = bool(item.get('hasAttachments', False))
+                            if 'Size' in _selected_set:
+                                row_data['Size'] = item.get('size', '')
+                            if 'MessageId' in _selected_set:
+                                row_data['MessageId'] = item.get('internetMessageId', '') or ''
 
                         if report_only:
                             self.log(f"  [报告] 发现: {subject} ({item_type})")
@@ -4090,7 +4305,7 @@ class UniversalEmailCleanerApp:
         except Exception as ue:
             self.log(f"  X 处理用户出错: {ue}", "ERROR")
             with csv_lock:
-                writer.writerow({'UserPrincipalName': user, 'Status': 'Error', 'Details': str(ue)})
+                writer.writerow({'SMTPAddress': user, 'UserPrincipalName': user, 'Status': 'Error', 'Details': str(ue)})
 
     # --- Graph Logic ---
     def run_graph_cleanup(self):
@@ -4127,14 +4342,27 @@ class UniversalEmailCleanerApp:
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 if target_type == "Meeting":
                     fieldnames = [
-                        'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
+                        'SMTPAddress', 'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID',
                         'iCalUId', 'SeriesMasterId',
                         'Organizer', 'Attendees', 'Start', 'End', 'UserRole',
                         'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
                         'Action', 'Status', 'Details'
                     ]
                 else:
-                    fieldnames = ['UserPrincipalName', 'ItemId', 'Folder', 'Subject', 'Sender/Organizer', 'Time', 'Type', 'Action', 'Status', 'Details']
+                    selected_result_fields = self._get_selected_result_fields()
+                    fieldnames = ['SMTPAddress', 'UserPrincipalName', 'ItemId']
+                    if 'Folder' in selected_result_fields:
+                        fieldnames.append('Folder')
+                    fieldnames.append('Subject')
+                    fieldnames.append('Sender/Organizer')
+                    fieldnames.append('Time')
+                    if 'HasAttachments' in selected_result_fields:
+                        fieldnames.append('HasAttachments')
+                    if 'Size' in selected_result_fields:
+                        fieldnames.append('Size')
+                    if 'MessageId' in selected_result_fields:
+                        fieldnames.append('MessageId')
+                    fieldnames.extend(['Type', 'Action', 'Status', 'Details'])
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
 
@@ -4203,16 +4431,18 @@ class UniversalEmailCleanerApp:
                 csv_lock = threading.Lock()
                 report_only = self.report_only_var.get()
                 permanent_delete = bool(self.permanent_delete_var.get()) and (not report_only) and (target_type == "Email")
+                selected_folders = self._get_selected_folders()
+                selected_result_fields = self._get_selected_result_fields()
                 
                 with ThreadPoolExecutor(max_workers=10) as executor:
                     futures = []
-                    mail_folder_scope = self.mail_folder_scope_var.get()
                     soft_delete = bool(self.soft_delete_var.get()) and (not report_only) and (target_type == "Email") and (not permanent_delete)
                     for user in users:
                         futures.append(executor.submit(
                             self.process_single_user_graph, 
                             user, graph_endpoint, headers, resource, delete_resource, target_type, filter_str, body_keyword,
-                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end, mail_folder_scope, permanent_delete, soft_delete
+                            report_only, writer, csv_lock, calendar_view_start, calendar_view_end,
+                            selected_folders, selected_result_fields, permanent_delete, soft_delete
                         ))
                     
                     # Wait for all to complete
@@ -4244,7 +4474,8 @@ class UniversalEmailCleanerApp:
     def process_single_user_ews(self, target_email, creds, config, auth_type, use_auto, target_type, 
                                 start_date_str, end_date_str, criteria_sender, criteria_msg_id, 
                                 criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope, 
-                                report_only, writer, csv_lock, log_level, mail_folder_scope: str | None = None, permanent_delete: bool = False, soft_delete: bool = False,
+                                report_only, writer, csv_lock, log_level, selected_folders: list[str] | None = None,
+                                selected_result_fields: list[str] | None = None, permanent_delete: bool = False, soft_delete: bool = False,
                                 access_token: str | None = None):
         try:
             self.log(f"--- 正在处理: {target_email} ---")
@@ -4301,122 +4532,56 @@ class UniversalEmailCleanerApp:
             page_size = 200
 
             if target_type == "Email":
-                def _infer_scope() -> str:
-                    s = (mail_folder_scope or "自动 (Auto)").strip().lower()
-                    if "common" in s or "常用" in s:
-                        return "common"
-                    if "sub" in s or "子文件夹" in s:
-                        return "inbox_subtree"
-                    if "sent" in s or "已发送" in s:
-                        return "sent_only"
-                    if "outbox" in s or "发件箱" in s:
-                        return "outbox_only"
-                    if "recoverable" in s or "可恢复" in s:
-                        if "purge" in s or "清除" in s:
-                            return "recoverable_items_purges"
-                        return "recoverable_items_deletions"
-                    if "deleted" in s or "已删除" in s:
-                        return "deleted_only"
-                    if "junk" in s or "垃圾" in s:
-                        return "junk_only"
-                    if "draft" in s or "草稿" in s:
-                        return "drafts_only"
-                    if "archive" in s or "存档" in s:
-                        return "archive_only"
-                    if "inbox" in s or "收件箱" in s:
-                        return "inbox_only"
-                    if ("all" in s or "全邮箱" in s):
-                        if "dumpster" in s or "recoverable" in s or "含" in s:
-                            return "all_with_dumpster"
-                        return "all"
-                    return "inbox_only"
-
-                scope = _infer_scope()
+                selected_folder_keys = selected_folders if selected_folders else ["inbox"]
+                selected_result_fields_set = set(selected_result_fields or [])
 
                 folders = []
                 try:
-                    if scope == "common":
-                        # Common set across mailboxes
-                        cand = []
-                        try:
-                            cand.append(account.inbox)
-                        except Exception:
-                            pass
-                        try:
-                            cand.append(getattr(account, "outbox"))
-                        except Exception:
-                            pass
-                        for attr in ("sent", "deleted_items", "junk", "drafts"):
+                    key_to_attr = {
+                        "inbox": "inbox",
+                        "sentitems": "sent",
+                        "outbox": "outbox",
+                        "deleteditems": "deleted_items",
+                        "junkemail": "junk",
+                        "drafts": "drafts",
+                        "recoverable_deletions": "recoverable_items_deletions",
+                        "recoverable_purges": "recoverable_items_purges",
+                    }
+
+                    for fk in selected_folder_keys:
+                        if fk == "inbox_subtree":
                             try:
-                                cand.append(getattr(account, attr))
+                                for f in account.inbox.walk():
+                                    cc = (getattr(f, 'container_class', '') or '')
+                                    if cc and not str(cc).startswith('IPF.Note'):
+                                        continue
+                                    if hasattr(f, 'all'):
+                                        folders.append(f)
                             except Exception:
                                 pass
-                        # Archive is not guaranteed; try attribute then name-search
-                        try:
-                            cand.append(getattr(account, "archive"))
-                        except Exception:
+                            continue
+
+                        if fk == "archive":
                             try:
-                                for f in account.root.walk():
-                                    if (getattr(f, 'name', '') or '').strip().lower() in ("archive", "存档"):
-                                        cand.append(f)
-                                        break
+                                folders.append(getattr(account, "archive"))
+                            except Exception:
+                                try:
+                                    for f in account.root.walk():
+                                        if (getattr(f, 'name', '') or '').strip().lower() in ("archive", "存档"):
+                                            folders.append(f)
+                                            break
+                                except Exception:
+                                    pass
+                            continue
+
+                        attr = key_to_attr.get(fk)
+                        if attr:
+                            try:
+                                folders.append(getattr(account, attr))
                             except Exception:
                                 pass
 
-                        for f in cand:
-                            if f and hasattr(f, 'all'):
-                                folders.append(f)
-                    elif scope == "sent_only":
-                        folders = [getattr(account, "sent")]
-                    elif scope == "outbox_only":
-                        folders = [getattr(account, "outbox")]
-                    elif scope == "deleted_only":
-                        folders = [getattr(account, "deleted_items")]
-                    elif scope == "recoverable_items_deletions":
-                        folders = [getattr(account, "recoverable_items_deletions")]
-                    elif scope == "recoverable_items_purges":
-                        folders = [getattr(account, "recoverable_items_purges")]
-                    elif scope == "junk_only":
-                        folders = [getattr(account, "junk")]
-                    elif scope == "drafts_only":
-                        folders = [getattr(account, "drafts")]
-                    elif scope == "archive_only":
-                        try:
-                            folders = [getattr(account, "archive")]
-                        except Exception:
-                            found = None
-                            try:
-                                for f in account.root.walk():
-                                    if (getattr(f, 'name', '') or '').strip().lower() in ("archive", "存档"):
-                                        found = f
-                                        break
-                            except Exception:
-                                found = None
-                            folders = [found] if found else []
-                    elif scope in ("all", "all_with_dumpster"):
-                        for f in account.root.walk():
-                            cc = (getattr(f, 'container_class', '') or '')
-                            if cc and not str(cc).startswith('IPF.Note'):
-                                continue
-                            if hasattr(f, 'all'):
-                                folders.append(f)
-                        if scope == "all_with_dumpster":
-                            try:
-                                folders.append(getattr(account, "recoverable_items_deletions"))
-                            except Exception:
-                                pass
-                            try:
-                                folders.append(getattr(account, "recoverable_items_purges"))
-                            except Exception:
-                                pass
-                    elif scope == "inbox_subtree":
-                        for f in account.inbox.walk():
-                            cc = (getattr(f, 'container_class', '') or '')
-                            if cc and not str(cc).startswith('IPF.Note'):
-                                continue
-                            if hasattr(f, 'all'):
-                                folders.append(f)
-                    else:
+                    if not folders:
                         folders = [account.inbox]
                 except Exception:
                     folders = [account.inbox]
@@ -4493,7 +4658,13 @@ class UniversalEmailCleanerApp:
                         if criteria_msg_id:
                             qs = qs.filter(message_id=criteria_msg_id)
 
-                        fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received', 'message_id']
+                        fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
+                        if 'MessageId' in selected_result_fields_set:
+                            fields.append('message_id')
+                        if 'HasAttachments' in selected_result_fields_set:
+                            fields.append('has_attachments')
+                        if 'Size' in selected_result_fields_set:
+                            fields.append('size')
                         if criteria_body:
                             fields.append('body')
                         try:
@@ -4516,10 +4687,9 @@ class UniversalEmailCleanerApp:
                             received_val = getattr(item, 'datetime_received', 'Unknown')
                             folder_name = getattr(folder, 'name', '') or ''
                             row = {
+                                'SMTPAddress': target_email,
                                 'UserPrincipalName': target_email,
                                 'ItemId': item_id,
-                                'MessageId': msg_id,
-                                'Folder': folder_name,
                                 'Subject': subject,
                                 'Sender': sender_val,
                                 'Received': received_val,
@@ -4527,6 +4697,15 @@ class UniversalEmailCleanerApp:
                                 'Status': 'Pending',
                                 'Details': ''
                             }
+
+                            if 'MessageId' in selected_result_fields_set:
+                                row['MessageId'] = msg_id
+                            if 'Folder' in selected_result_fields_set:
+                                row['Folder'] = folder_name
+                            if 'HasAttachments' in selected_result_fields_set:
+                                row['HasAttachments'] = bool(getattr(item, 'has_attachments', False))
+                            if 'Size' in selected_result_fields_set:
+                                row['Size'] = getattr(item, 'size', '')
 
                             if report_only:
                                 self.log(f"  [报告] 发现: {item.subject}")
@@ -4771,6 +4950,7 @@ class UniversalEmailCleanerApp:
                             pass
 
                     row = {
+                        'SMTPAddress': target_email,
                         'UserPrincipalName': target_email,
                         'ItemId': item_id,
                         'Subject': subject,
@@ -4797,6 +4977,7 @@ class UniversalEmailCleanerApp:
                     sender_val = item.sender.email_address if item.sender else 'Unknown'
                     received_val = getattr(item, 'datetime_received', 'Unknown')
                     row = {
+                        'SMTPAddress': target_email,
                         'UserPrincipalName': target_email,
                         'MessageId': item_id,
                         'Subject': subject,
@@ -4833,7 +5014,7 @@ class UniversalEmailCleanerApp:
             self.log(f"  处理用户 {target_email} 出错: {e}", "ERROR")
             self.log(f"  Traceback: {traceback.format_exc()}", is_advanced=True)
             with csv_lock:
-                writer.writerow({'UserPrincipalName': target_email, 'Status': 'Error', 'Details': str(e)})
+                writer.writerow({'SMTPAddress': target_email, 'UserPrincipalName': target_email, 'Status': 'Error', 'Details': str(e)})
 
     # --- EWS Logic ---
     def run_ews_cleanup(self):
@@ -4938,13 +5119,24 @@ class UniversalEmailCleanerApp:
             target_type = self.cleanup_target_var.get()
             if target_type == "Meeting":
                 fieldnames = [
-                    'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID', 
+                    'SMTPAddress', 'UserPrincipalName', 'ItemId', 'Subject', 'Type', 'MeetingGOID', 'CleanGOID', 
                     'Organizer', 'Attendees', 'Start', 'End', 'UserRole', 
                     'IsCancelled', 'ResponseStatus', 'RecurrencePattern', 'PatternDetails', 'RecurrenceDuration', 'IsEndless',
                     'Action', 'Status', 'Details'
                 ]
             else:
-                fieldnames = ['UserPrincipalName', 'ItemId', 'MessageId', 'Folder', 'Subject', 'Sender', 'Received', 'Action', 'Status', 'Details']
+                selected_result_fields = self._get_selected_result_fields()
+                fieldnames = ['SMTPAddress', 'UserPrincipalName', 'ItemId']
+                if 'MessageId' in selected_result_fields:
+                    fieldnames.append('MessageId')
+                if 'Folder' in selected_result_fields:
+                    fieldnames.append('Folder')
+                fieldnames.extend(['Subject', 'Sender', 'Received'])
+                if 'HasAttachments' in selected_result_fields:
+                    fieldnames.append('HasAttachments')
+                if 'Size' in selected_result_fields:
+                    fieldnames.append('Size')
+                fieldnames.extend(['Action', 'Status', 'Details'])
 
             with open(report_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -4966,7 +5158,8 @@ class UniversalEmailCleanerApp:
                 meeting_scope = self.meeting_scope_var.get()
                 report_only = self.report_only_var.get()
                 log_level = self.log_level_var.get()
-                mail_folder_scope = self.mail_folder_scope_var.get()
+                selected_folders = self._get_selected_folders()
+                selected_result_fields = self._get_selected_result_fields()
                 permanent_delete = bool(self.permanent_delete_var.get()) and (not report_only) and (target_type == "Email")
                 soft_delete = bool(self.soft_delete_var.get()) and (not report_only) and (target_type == "Email") and (not permanent_delete)
                 
@@ -4980,7 +5173,8 @@ class UniversalEmailCleanerApp:
                             target_email, creds, config, auth_type, use_auto, target_type,
                             start_date_str, end_date_str, criteria_sender, criteria_msg_id,
                             criteria_subject, criteria_body, meeting_only_cancelled, meeting_scope,
-                            report_only, writer, csv_lock, log_level, mail_folder_scope, permanent_delete, soft_delete,
+                            report_only, writer, csv_lock, log_level, selected_folders, selected_result_fields,
+                            permanent_delete, soft_delete,
                             token
                         ))
                     
