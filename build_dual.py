@@ -1,14 +1,11 @@
 """
-UniversalEmailCleaner - 双版本构建脚本
-======================================
-自动构建两个版本:
-  1. 带 License 的版本 (需要激活码)
-  2. 不带 License 的版本 (名称后缀 _nolicense)
+UniversalEmailCleaner - 发布构建脚本
+===================================
+仅构建当前正式发布版本。
 
 用法:
-    python build_dual.py                          # 使用当前 spec 中的版本号
-    python build_dual.py --version v1.13.0        # 指定版本号 (自动生成 spec)
-    python build_dual.py --keygen                 # 同时构建密钥生成器
+        python build_dual.py                   # 使用源码中的版本号
+        python build_dual.py --version v1.14.5 # 指定版本号并自动生成 spec
 """
 
 import argparse
@@ -61,89 +58,6 @@ exe = EXE(
 )
 """
 
-SPEC_TEMPLATE_NOLICENSE = r"""# -*- mode: python ; coding: utf-8 -*-
-# No-License 版本 — 不包含 license_manager，启动无需激活
-
-
-a = Analysis(
-    ['universal_email_cleaner.py'],
-    pathex=[],
-    binaries=[],
-    datas=[('graph-mail-delete.ico', '.'), ('avatar_b64.txt', '.')],
-    hiddenimports=[],
-    hookspath=[],
-    hooksconfig={{}},
-    runtime_hooks=[],
-    excludes=['license_manager'],
-    noarchive=False,
-    optimize=0,
-)
-pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='UniversalEmailCleaner_{version}_nolicense',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=['graph-mail-delete.ico'],
-)
-"""
-
-SPEC_TEMPLATE_KEYGEN = r"""# -*- mode: python ; coding: utf-8 -*-
-
-
-a = Analysis(
-    ['license_keygen.py'],
-    pathex=[],
-    binaries=[],
-    datas=[('license_manager.py', '.')],
-    hiddenimports=['license_manager'],
-    hookspath=[],
-    hooksconfig={{}},
-    runtime_hooks=[],
-    excludes=[],
-    noarchive=False,
-    optimize=0,
-)
-pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='UniversalEmailCleaner_KeyGen',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-"""
-
-
 def get_version_from_source() -> str:
     """从 universal_email_cleaner.py 中提取 APP_VERSION"""
     src = os.path.join(SCRIPT_DIR, 'universal_email_cleaner.py')
@@ -174,11 +88,8 @@ def run_pyinstaller(spec_path: str, label: str) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='UniversalEmailCleaner 双版本构建工具')
+    parser = argparse.ArgumentParser(description='UniversalEmailCleaner 发布构建工具')
     parser.add_argument('--version', '-v', help='版本号 (例: v1.13.0)，不指定则从源码读取')
-    parser.add_argument('--keygen', '-k', action='store_true', help='同时构建密钥生成器')
-    parser.add_argument('--license-only', action='store_true', help='仅构建带 License 版本')
-    parser.add_argument('--nolicense-only', action='store_true', help='仅构建不带 License 版本')
     args = parser.parse_args()
 
     version = args.version or get_version_from_source()
@@ -186,38 +97,13 @@ def main():
 
     # 生成 spec 文件
     spec_license = os.path.join(SCRIPT_DIR, f'UniversalEmailCleaner_{version}.spec')
-    spec_nolicense = os.path.join(SCRIPT_DIR, f'UniversalEmailCleaner_{version}_nolicense.spec')
-    spec_keygen = os.path.join(SCRIPT_DIR, 'UniversalEmailCleaner_KeyGen.spec')
-
-    build_license = not args.nolicense_only
-    build_nolicense = not args.license_only
-
-    if build_license:
-        with open(spec_license, 'w', encoding='utf-8') as f:
-            f.write(SPEC_TEMPLATE_LICENSE.format(version=version))
-
-    if build_nolicense:
-        with open(spec_nolicense, 'w', encoding='utf-8') as f:
-            f.write(SPEC_TEMPLATE_NOLICENSE.format(version=version))
-
-    if args.keygen:
-        with open(spec_keygen, 'w', encoding='utf-8') as f:
-            f.write(SPEC_TEMPLATE_KEYGEN.format())
+    with open(spec_license, 'w', encoding='utf-8') as f:
+        f.write(SPEC_TEMPLATE_LICENSE.format(version=version))
 
     results = []
 
-    # 构建
-    if build_license:
-        ok = run_pyinstaller(spec_license, f'带 License 版 ({version})')
-        results.append((f'UniversalEmailCleaner_{version}.exe', ok))
-
-    if build_nolicense:
-        ok = run_pyinstaller(spec_nolicense, f'无 License 版 ({version}_nolicense)')
-        results.append((f'UniversalEmailCleaner_{version}_nolicense.exe', ok))
-
-    if args.keygen:
-        ok = run_pyinstaller(spec_keygen, 'KeyGen 密钥生成器')
-        results.append(('UniversalEmailCleaner_KeyGen.exe', ok))
+    ok = run_pyinstaller(spec_license, f'正式发布版 ({version})')
+    results.append((f'UniversalEmailCleaner_{version}.exe', ok))
 
     # 汇总
     print(f"\n{'='*60}")
