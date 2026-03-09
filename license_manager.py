@@ -1,28 +1,29 @@
 """
 License Key Management for UniversalEmailCleaner
 =================================================
-AES-256-GCM 加密许可证密钥系统，使用 PBKDF2-HMAC-SHA256 密钥派生。
+机器码绑定许可证系统。
 
-密钥格式:
-  - 4 字节随机 nonce + AES-256-GCM 加密载荷 (5 字节明文 → 21 字节密文+标签) = 25 字节
-  - Base32 编码 → 40 字符
-  - 显示格式: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX (8 组 × 5 字符)
+密钥明文载荷:
+  - version (1 byte)
+  - duration_code (1 byte)
+  - created_day_offset (2 bytes, from 2024-01-01)
+  - machine_hash8 (8 bytes, SHA256(machine_code) 前 8 字节)
+  - random_pad (1 byte)
 
-加密载荷:
-  - 版本号 (1 字节)
-  - 有效期代码 (1 字节): 0=1天, 1=1周, 2=1月, 3=6月, 4=1年, 5=永久
-  - 创建时间 (2 字节): 自 2024-01-01 起的天数偏移 (uint16)
-  - 随机填充 (1 字节)
+密钥封装:
+  - nonce 4 bytes + AES-GCM(ciphertext+tag)
+  - Base32 可读分组格式
 """
 
-import struct
-import os
-import json
 import base64
+from datetime import datetime, timedelta
 import hashlib
 import hmac
-import time
-from datetime import datetime, timedelta
+import json
+import os
+import platform
+import struct
+import uuid
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -30,10 +31,13 @@ try:
 except ImportError:
     _HAS_AESGCM = False
 
+try:
+    import winreg
+except Exception:
+    winreg = None
 
-# ===================== 常量 =====================
 
-LICENSE_VERSION = 1
+LICENSE_VERSION = 2
 EPOCH_DATE = datetime(2024, 1, 1)
 
 DURATION_MAP = {
@@ -45,140 +49,143 @@ DURATION_MAP = {
     5: ("永久 (Permanent)", None),
 }
 
-# PBKDF2 密钥派生参数 (拆分以增加逆向难度)
 _KD_PARTS = [
-    b'\x55\x45\x43\x5f',  # UEC_
-    b'\x41\x45\x53\x32',  # AES2
-    b'\x35\x36\x5f\x47',  # 56_G
-    b'\x43\x4d\x5f\x4c',  # CM_L
-    b'\x49\x43\x5f\x56',  # IC_V
-    b'\x31\x5f\x53\x45',  # 1_SE
-    b'\x43\x52\x45\x54',  # CRET
-    b'\x5f\x4b\x45\x59',  # _KEY
+    b'\x55\x45\x43\x5f',
+    b'\x41\x45\x53\x32',
+    b'\x35\x36\x5f\x47',
+    b'\x43\x4d\x5f\x4c',
+    b'\x49\x43\x5f\x56',
+    b'\x31\x5f\x53\x45',
+    b'\x43\x52\x45\x54',
+    b'\x5f\x4b\x45\x59',
 ]
-_KD_SALT = b'UEC_AES256GCM_LICENSE_SALT_2024_v1'
+_KD_SALT = b'UEC_AES256GCM_LICENSE_SALT_2024_v2_MACHINE'
 _KD_ITERATIONS = 100_000
 
-# 缓存派生密钥
 _cached_aes_key = None
+_cached_machine_code = None
 
 
-# ===================== 内部函数 =====================
-
-def _derive_key():
-    """使用 PBKDF2-HMAC-SHA256 派生 AES-256 密钥 (32 字节)"""
+def _derive_key() -> bytes:
     global _cached_aes_key
     if _cached_aes_key is not None:
         return _cached_aes_key
     passphrase = b''.join(_KD_PARTS)
-    _cached_aes_key = hashlib.pbkdf2_hmac(
-        'sha256', passphrase, _KD_SALT, _KD_ITERATIONS
-    )
+    _cached_aes_key = hashlib.pbkdf2_hmac('sha256', passphrase, _KD_SALT, _KD_ITERATIONS)
     return _cached_aes_key
 
 
 def _derive_iv(aes_key: bytes, nonce: bytes) -> bytes:
-    """从 AES 密钥和 nonce 确定性地派生 12 字节 GCM IV"""
     return hashlib.sha256(aes_key + nonce).digest()[:12]
 
 
 def _format_key(raw_bytes: bytes) -> str:
-    """将原始字节格式化为人类可读的许可证密钥"""
     encoded = base64.b32encode(raw_bytes).decode('ascii').rstrip('=')
     groups = [encoded[i:i + 5] for i in range(0, len(encoded), 5)]
     return '-'.join(groups)
 
 
 def _parse_key(key_str: str) -> bytes:
-    """将人类可读的许可证密钥解析回原始字节"""
     cleaned = key_str.replace('-', '').replace(' ', '').strip().upper()
     padding = (8 - len(cleaned) % 8) % 8
     cleaned += '=' * padding
     return base64.b32decode(cleaned)
 
 
-# ===================== HMAC 回退 (无 cryptography 库时使用) =====================
+def _get_machine_guid_win() -> str:
+    if platform.system().lower() != 'windows' or winreg is None:
+        return ''
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            val, _ = winreg.QueryValueEx(key, "MachineGuid")
+            return str(val).strip()
+    except Exception:
+        return ''
+
+
+def _normalize_machine_code(machine_code: str) -> str:
+    return ''.join(ch for ch in machine_code.upper() if ch.isalnum())
+
+
+def _format_machine_code(raw_hex: str) -> str:
+    groups = [raw_hex[i:i + 4] for i in range(0, len(raw_hex), 4)]
+    return '-'.join(groups)
+
+
+def get_machine_code() -> str:
+    global _cached_machine_code
+    if _cached_machine_code:
+        return _cached_machine_code
+
+    parts = [
+        platform.system(),
+        platform.release(),
+        platform.machine(),
+        platform.node(),
+        str(uuid.getnode()),
+        _get_machine_guid_win(),
+    ]
+    raw = '|'.join(part.strip() for part in parts if part and str(part).strip())
+    digest_hex = hashlib.sha256(raw.encode('utf-8')).hexdigest().upper()[:32]
+    _cached_machine_code = _format_machine_code(digest_hex)
+    return _cached_machine_code
+
+
+def _machine_hash8(machine_code: str) -> bytes:
+    normalized = _normalize_machine_code(machine_code)
+    return hashlib.sha256(normalized.encode('utf-8')).digest()[:8]
+
 
 def _hmac_generate(aes_key: bytes, plaintext: bytes, nonce: bytes) -> bytes:
-    """使用 HMAC-SHA256 流密码加密 + MAC 认证 (回退方案)"""
-    # 生成密钥流用于 XOR 加密
     keystream = hmac.new(aes_key, b'\x01' + nonce, hashlib.sha256).digest()[:len(plaintext)]
     encrypted = bytes(a ^ b for a, b in zip(plaintext, keystream))
-    # Encrypt-then-MAC
     mac = hmac.new(aes_key, b'\x02' + nonce + encrypted, hashlib.sha256).digest()[:16]
-    return nonce + encrypted + mac  # 4 + 5 + 16 = 25 bytes
+    return nonce + encrypted + mac
 
 
 def _hmac_decrypt(aes_key: bytes, raw: bytes) -> bytes:
-    """解密 HMAC 回退方案的密钥"""
     nonce = raw[:4]
     encrypted = raw[4:-16]
     mac = raw[-16:]
-    # 验证 MAC
     expected_mac = hmac.new(aes_key, b'\x02' + nonce + encrypted, hashlib.sha256).digest()[:16]
     if not hmac.compare_digest(mac, expected_mac):
         raise ValueError("MAC 验证失败")
-    # 解密
     keystream = hmac.new(aes_key, b'\x01' + nonce, hashlib.sha256).digest()[:len(encrypted)]
-    plaintext = bytes(a ^ b for a, b in zip(encrypted, keystream))
-    return plaintext
+    return bytes(a ^ b for a, b in zip(encrypted, keystream))
 
 
-# ===================== 公共 API =====================
+def _calc_remaining_days(expires: datetime | None) -> int | None:
+    if expires is None:
+        return None
+    return max(0, (expires.date() - datetime.now().date()).days)
 
-def generate_license_key(duration_code: int) -> str:
-    """
-    生成加密的许可证密钥。
 
-    Args:
-        duration_code: 0=1天, 1=1周, 2=1月, 3=6月, 4=1年, 5=永久
-
-    Returns:
-        格式化的许可证密钥字符串 (40 字符, 8×5 分组)
-    """
+def generate_license_key(duration_code: int, machine_code: str | None = None) -> str:
     if duration_code not in DURATION_MAP:
         raise ValueError(f"无效的有效期代码: {duration_code}")
 
+    machine_code = machine_code or get_machine_code()
+    machine_hash = _machine_hash8(machine_code)
+
     aes_key = _derive_key()
     nonce = os.urandom(4)
-
-    # 自纪元以来的天数偏移
-    day_offset = (datetime.now() - EPOCH_DATE).days
-    if day_offset < 0:
-        day_offset = 0
+    day_offset = max(0, (datetime.now() - EPOCH_DATE).days)
     random_byte = os.urandom(1)
 
-    # 明文: version(1) + duration(1) + day_offset(2) + random(1) = 5 字节
-    plaintext = struct.pack('>BBH', LICENSE_VERSION, duration_code, day_offset) + random_byte
+    plaintext = struct.pack('>BBH', LICENSE_VERSION, duration_code, day_offset) + machine_hash + random_byte
 
     if _HAS_AESGCM:
-        # AES-256-GCM 加密
         iv = _derive_iv(aes_key, nonce)
         aesgcm = AESGCM(aes_key)
-        ct_tag = aesgcm.encrypt(iv, plaintext, nonce)  # 5 + 16 = 21 字节
-        raw = nonce + ct_tag  # 4 + 21 = 25 字节
+        ct_tag = aesgcm.encrypt(iv, plaintext, nonce)
+        raw = nonce + ct_tag
     else:
-        # HMAC 回退方案
-        raw = _hmac_generate(aes_key, plaintext, nonce)  # 25 字节
+        raw = _hmac_generate(aes_key, plaintext, nonce)
 
     return _format_key(raw)
 
 
-def validate_license_key(key_str: str) -> dict:
-    """
-    验证并解码许可证密钥。
-
-    Returns:
-        dict: {
-            valid: bool,
-            duration_code: int or None,
-            duration_name: str or None,
-            created: datetime or None,
-            expires: datetime or None,
-            expired: bool,
-            error: str or None,
-        }
-    """
+def validate_license_key(key_str: str, machine_code: str | None = None) -> dict:
     result = {
         'valid': False,
         'duration_code': None,
@@ -186,6 +193,9 @@ def validate_license_key(key_str: str) -> dict:
         'created': None,
         'expires': None,
         'expired': False,
+        'days_remaining': None,
+        'machine_bound': False,
+        'machine_match': False,
         'error': None,
     }
 
@@ -195,55 +205,56 @@ def validate_license_key(key_str: str) -> dict:
         result['error'] = f"密钥格式无效: {e}"
         return result
 
-    if len(raw) < 25:
+    if len(raw) < 33:
         result['error'] = "密钥长度不正确"
         return result
 
     aes_key = _derive_key()
     nonce = raw[:4]
-
-    # 尝试解密
     plaintext = None
+
     if _HAS_AESGCM:
         try:
             iv = _derive_iv(aes_key, nonce)
-            ct_tag = raw[4:]
-            aesgcm = AESGCM(aes_key)
-            plaintext = aesgcm.decrypt(iv, ct_tag, nonce)
+            plaintext = AESGCM(aes_key).decrypt(iv, raw[4:], nonce)
         except Exception:
             pass
 
     if plaintext is None:
-        # 尝试 HMAC 回退
         try:
             plaintext = _hmac_decrypt(aes_key, raw)
         except Exception:
             result['error'] = "密钥无效或已损坏 (解密/验证失败)"
             return result
 
-    if len(plaintext) < 5:
+    if len(plaintext) < 13:
         result['error'] = "密钥数据损坏"
         return result
 
     version, duration_code, day_offset = struct.unpack('>BBH', plaintext[:4])
+    machine_hash = plaintext[4:12]
 
     if version != LICENSE_VERSION:
         result['error'] = f"不支持的密钥版本: {version}"
         return result
-
     if duration_code not in DURATION_MAP:
         result['error'] = f"无效的有效期代码: {duration_code}"
         return result
 
+    machine_code = machine_code or get_machine_code()
+    expected_hash = _machine_hash8(machine_code)
+    machine_match = hmac.compare_digest(machine_hash, expected_hash)
+
+    if not machine_match:
+        result['error'] = "该密钥不属于当前机器 (Machine Code 不匹配)"
+        result['machine_bound'] = True
+        result['machine_match'] = False
+        return result
+
     duration_name, delta = DURATION_MAP[duration_code]
     created = EPOCH_DATE + timedelta(days=day_offset)
-
-    if delta is not None:
-        expires = created + delta
-        expired = datetime.now() > expires
-    else:
-        expires = None
-        expired = False
+    expires = created + delta if delta is not None else None
+    expired = datetime.now() > expires if expires else False
 
     result.update({
         'valid': True,
@@ -252,15 +263,14 @@ def validate_license_key(key_str: str) -> dict:
         'created': created,
         'expires': expires,
         'expired': expired,
+        'days_remaining': _calc_remaining_days(expires),
+        'machine_bound': True,
+        'machine_match': True,
     })
-
     return result
 
 
-# ===================== 许可证文件管理 =====================
-
 def get_license_dir() -> str:
-    """获取许可证存储目录"""
     docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "UniversalEmailCleaner")
     if not os.path.exists(docs_dir):
         os.makedirs(docs_dir)
@@ -268,23 +278,20 @@ def get_license_dir() -> str:
 
 
 def get_license_path() -> str:
-    """获取许可证文件路径"""
     return os.path.join(get_license_dir(), "license.dat")
 
 
-def save_license(key_str: str) -> None:
-    """保存已激活的许可证密钥"""
-    license_path = get_license_path()
+def save_license(key_str: str, machine_code: str | None = None) -> None:
     data = {
         'key': key_str.strip(),
+        'machine_code': machine_code or get_machine_code(),
         'activated_at': datetime.now().isoformat(),
     }
-    with open(license_path, 'w', encoding='utf-8') as f:
+    with open(get_license_path(), 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
 
 
 def load_license() -> str | None:
-    """加载已保存的许可证密钥。返回密钥字符串或 None"""
     license_path = get_license_path()
     if not os.path.exists(license_path):
         return None
@@ -296,58 +303,38 @@ def load_license() -> str | None:
         return None
 
 
-def check_license() -> dict:
-    """
-    检查应用程序是否已正确授权。
-
-    Returns:
-        dict: {licensed: bool, info: dict or None, error: str or None}
-    """
+def check_license(machine_code: str | None = None) -> dict:
     key = load_license()
     if not key:
         return {'licensed': False, 'info': None, 'error': '未找到许可证'}
 
-    info = validate_license_key(key)
+    info = validate_license_key(key, machine_code=machine_code)
     if not info['valid']:
         return {'licensed': False, 'info': info, 'error': info['error']}
 
     if info['expired']:
         exp_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '未知'
-        return {
-            'licensed': False,
-            'info': info,
-            'error': f"许可证已过期 (到期时间: {exp_str})",
-        }
+        return {'licensed': False, 'info': info, 'error': f"许可证已过期 (到期时间: {exp_str})"}
 
     return {'licensed': True, 'info': info, 'error': None}
 
 
-def activate_license(key_str: str) -> dict:
-    """
-    使用给定的许可证密钥激活。
-
-    Returns:
-        dict: {success: bool, info: dict, error: str or None}
-    """
-    info = validate_license_key(key_str)
+def activate_license(key_str: str, machine_code: str | None = None) -> dict:
+    machine_code = machine_code or get_machine_code()
+    info = validate_license_key(key_str, machine_code=machine_code)
 
     if not info['valid']:
         return {'success': False, 'info': info, 'error': info['error']}
 
     if info['expired']:
         exp_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '未知'
-        return {
-            'success': False,
-            'info': info,
-            'error': f"该许可证已过期 (到期时间: {exp_str})",
-        }
+        return {'success': False, 'info': info, 'error': f"该许可证已过期 (到期时间: {exp_str})"}
 
-    save_license(key_str)
+    save_license(key_str, machine_code=machine_code)
     return {'success': True, 'info': info, 'error': None}
 
 
 def deactivate_license() -> None:
-    """移除当前许可证"""
     license_path = get_license_path()
     if os.path.exists(license_path):
         os.remove(license_path)

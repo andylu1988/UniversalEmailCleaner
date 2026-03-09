@@ -24,13 +24,13 @@ from requests.adapters import HTTPAdapter
 try:
     from license_manager import (
         check_license, activate_license, deactivate_license,
-        validate_license_key, DURATION_MAP,
+        validate_license_key, DURATION_MAP, get_machine_code,
     )
     _HAS_LICENSE = True
 except ImportError:
     _HAS_LICENSE = False
 
-APP_VERSION = "v1.14.1"
+APP_VERSION = "v1.14.5"
 
 # Use a stable AppUserModelID on Windows. If this changes per version, Windows may keep
 # showing a cached/pinned icon from an older shortcut.
@@ -972,7 +972,8 @@ class EwsTraceAdapter(NoVerifyHTTPAdapter):
 class UniversalEmailCleanerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)")
+        self._base_title = f"通用邮件清理工具 {APP_VERSION} (Graph API & EWS)"
+        self.root.title(self._base_title)
         self.root.geometry("1280x960")
         self.root.minsize(1000, 750)
 
@@ -1102,6 +1103,8 @@ class UniversalEmailCleanerApp:
         menubar.add_cascade(label="帮助 (Help)", menu=help_menu)
         root.config(menu=menubar)
 
+        self.refresh_window_title()
+
         # --- Variables ---
         # Graph Config
         self.graph_auth_mode_var = tk.StringVar(value="Auto") # Auto (Cert) or Manual (Secret) or Token
@@ -1147,8 +1150,13 @@ class UniversalEmailCleanerApp:
 
         # Criteria
         self.criteria_msg_id = tk.StringVar()
+        self.criteria_goid = tk.StringVar()
+        self.criteria_clean_goid = tk.StringVar()
         self.criteria_subject = tk.StringVar()
         self.criteria_sender = tk.StringVar()
+        self.criteria_attendee = tk.StringVar()
+        self.criteria_recipient = tk.StringVar()
+        self.criteria_has_attachments = tk.BooleanVar(value=False)
         self.criteria_body = tk.StringVar()
         self.criteria_start_date = tk.StringVar()
         self.criteria_end_date = tk.StringVar()
@@ -1175,6 +1183,7 @@ class UniversalEmailCleanerApp:
         self._scan_results_columns: list[str] = [] # column headers
         self._last_report_path: str = ""            # path of most recent report CSV
         self._scan_checked: dict[str, bool] = {}   # iid -> checked
+        self._target_identity_column: str | None = None  # SMTPAddress or UserPrincipalName
 
         # --- UI Layout ---
         main_frame = ttk.Frame(root)
@@ -1234,8 +1243,8 @@ class UniversalEmailCleanerApp:
         self.btn_toggle_log = ttk.Button(log_toolbar, text="隐藏日志 (Hide Log)", command=toggle_log, width=20)
         self.btn_toggle_log.pack(side="right")
 
-        # 日志级别选择器 — 放在隐藏日志按钮左侧
-        ttk.Label(log_toolbar, text="日志级别:").pack(side="right", padx=(10, 2))
+        # 日志级别选择器 — 调整到左侧
+        ttk.Label(log_toolbar, text="日志级别:").pack(side="left", padx=(0, 4))
         log_level_cb = ttk.Combobox(
             log_toolbar,
             textvariable=self.log_level_var,
@@ -1243,7 +1252,7 @@ class UniversalEmailCleanerApp:
             state="readonly",
             width=10,
         )
-        log_level_cb.pack(side="right", padx=(0, 4))
+        log_level_cb.pack(side="left", padx=(0, 8))
         log_level_cb.bind("<<ComboboxSelected>>", lambda _e: on_log_level_change_request())
 
         # 清除日志显示按钮
@@ -1252,7 +1261,7 @@ class UniversalEmailCleanerApp:
             self.log_area.delete('1.0', tk.END)
             self.log_area.config(state='disabled')
 
-        ttk.Button(log_toolbar, text="清除日志 (Clear)", command=clear_log_display, width=16).pack(side="right", padx=(0, 6))
+        ttk.Button(log_toolbar, text="清除日志 (Clear)", command=clear_log_display, width=16).pack(side="left", padx=(0, 6))
 
         self.log_area = scrolledtext.ScrolledText(log_frame, height=12, state='disabled', font=("Consolas", 10))
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
@@ -1332,6 +1341,9 @@ class UniversalEmailCleanerApp:
 
     def _get_selected_result_fields(self) -> list[str]:
         """Return list of selected result field keys."""
+        if self.cleanup_target_var.get() == "Meeting":
+            return []
+
         if self.search_detail_var.get() == "lite":
             selected = [k for k, l, is_lite, is_full in self.RESULT_FIELD_DEFS if is_lite]
         elif self.search_detail_var.get() == "custom":
@@ -1428,6 +1440,10 @@ class UniversalEmailCleanerApp:
 
     def _show_result_fields_picker(self):
         """Show result field multi-select popup."""
+        if self.cleanup_target_var.get() == "Meeting":
+            messagebox.showinfo("提示", "会议扫描使用固定字段，当前无需自定义搜索字段。")
+            return
+
         dlg = tk.Toplevel(self.root)
         dlg.title("选择搜索结果字段 (Select Result Fields)")
         dlg.resizable(False, False)
@@ -1483,6 +1499,9 @@ class UniversalEmailCleanerApp:
 
     def _get_folder_summary_text(self) -> str:
         """Return a short summary of selected folders for display."""
+        if self.cleanup_target_var.get() == "Meeting":
+            return "会议扫描不适用文件夹"
+
         selected = self._get_selected_folders()
         if not selected:
             return "(未选择文件夹)"
@@ -1497,6 +1516,10 @@ class UniversalEmailCleanerApp:
 
     def _on_folder_picker_click(self):
         """Open folder picker and update summary."""
+        if self.cleanup_target_var.get() == "Meeting":
+            messagebox.showinfo("提示", "会议扫描不支持按邮件文件夹筛选。")
+            return
+
         self._show_folder_picker()
         self._folder_summary_var.set(self._get_folder_summary_text())
         # Enforce folder field when multiple folders selected
@@ -1561,26 +1584,34 @@ class UniversalEmailCleanerApp:
             messagebox.showinfo("许可证", "许可证模块未加载。")
             return
 
+        machine_code = get_machine_code()
         status = check_license()
         info = status.get('info')
 
         if status['licensed'] and info:
             expires_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '永久'
             created_str = info['created'].strftime('%Y-%m-%d') if info['created'] else '未知'
+            remain_str = "永久" if info.get('days_remaining') is None else f"{info.get('days_remaining')} 天"
             msg = (
                 f"✅ 许可证状态: 已激活\n\n"
+                f"机器码: {machine_code}\n"
                 f"有效期类型: {info['duration_name']}\n"
                 f"创建日期: {created_str}\n"
                 f"到期日期: {expires_str}\n"
+                f"剩余天数: {remain_str}\n"
             )
             messagebox.showinfo("许可证状态 (License Status)", msg)
         else:
             err = status.get('error', '未知错误')
-            messagebox.showwarning("许可证状态 (License Status)", f"❌ {err}")
+            messagebox.showwarning("许可证状态 (License Status)", f"❌ {err}\n\n机器码:\n{machine_code}")
 
     def show_license_activation(self):
         """显示密钥输入窗口"""
-        _show_activation_dialog(self.root, on_success=lambda: self.log(">>> 许可证已激活。"))
+        _show_activation_dialog(
+            self.root,
+            on_success=lambda: (self.log(">>> 许可证已激活。"), self.refresh_window_title()),
+            allow_exit=True,
+        )
 
     def do_deactivate_license(self):
         """取消激活许可证"""
@@ -1592,13 +1623,31 @@ class UniversalEmailCleanerApp:
         )
         if confirm:
             deactivate_license()
+            self.refresh_window_title()
             messagebox.showinfo("完成", "许可证已取消激活。\n应用将在下次启动时要求重新激活。")
+
+    def refresh_window_title(self):
+        if not _HAS_LICENSE:
+            self.root.title(self._base_title)
+            return
+
+        status = check_license()
+        if status.get('licensed'):
+            info = status.get('info') or {}
+            days_remaining = info.get('days_remaining')
+            if days_remaining is None:
+                suffix = "（注册版，永久授权）"
+            else:
+                suffix = f"（注册版，使用期限还剩{days_remaining}天）"
+            self.root.title(f"{self._base_title} {suffix}")
+        else:
+            self.root.title(f"{self._base_title} （未注册）")
 
     def show_about(self):
         about = tk.Toplevel(self.root)
         about.title("关于")
         about.resizable(False, False)
-        about.geometry("520x260")
+        about.geometry("560x330")
         about.transient(self.root)
         about.grab_set()
 
@@ -1621,6 +1670,18 @@ class UniversalEmailCleanerApp:
 
         ttk.Label(text_col, text=f"通用邮件清理工具 (Universal Email Cleaner) {APP_VERSION}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(text_col, text="支持 Microsoft Graph API 和 Exchange Web Services (EWS)。\n用于批量清理或生成邮件报告。", justify="left").pack(anchor="w", pady=(6, 8))
+
+        if _HAS_LICENSE:
+            machine_code = get_machine_code()
+            status = check_license()
+            if status.get('licensed') and status.get('info'):
+                info = status['info']
+                remain_text = "永久" if info.get('days_remaining') is None else f"{info.get('days_remaining')} 天"
+                lic_text = f"授权状态: 已注册 | 剩余: {remain_text}"
+            else:
+                lic_text = "授权状态: 未注册"
+            ttk.Label(text_col, text=lic_text).pack(anchor="w", pady=(2, 0))
+            ttk.Label(text_col, text=f"机器码: {machine_code}", font=("Consolas", 9)).pack(anchor="w", pady=(2, 8))
 
         link = tk.Label(text_col, text=GITHUB_PROJECT_URL, fg="#1a73e8", cursor="hand2")
         try:
@@ -1699,6 +1760,23 @@ class UniversalEmailCleanerApp:
                     self.csv_path_var.set(config.get('csv_path', ''))
                     try:
                         self.target_single_email_var.set(config.get('target_single_email', ''))
+                    except Exception:
+                        pass
+                    try:
+                        self.criteria_msg_id.set(config.get('criteria_msg_id', ''))
+                        self.criteria_goid.set(config.get('criteria_goid', ''))
+                        self.criteria_clean_goid.set(config.get('criteria_clean_goid', ''))
+                        self.criteria_subject.set(config.get('criteria_subject', ''))
+                        self.criteria_sender.set(config.get('criteria_sender', ''))
+                        self.criteria_attendee.set(config.get('criteria_attendee', ''))
+                        self.criteria_recipient.set(config.get('criteria_recipient', ''))
+                        self.criteria_has_attachments.set(bool(config.get('criteria_has_attachments', False)))
+                        self.criteria_body.set(config.get('criteria_body', ''))
+                        self.criteria_start_date.set(config.get('criteria_start_date', ''))
+                        self.criteria_end_date.set(config.get('criteria_end_date', ''))
+                        self.cleanup_target_var.set(config.get('cleanup_target', 'Email'))
+                        self.meeting_scope_var.set(config.get('meeting_scope', 'All'))
+                        self.meeting_only_cancelled_var.set(bool(config.get('meeting_only_cancelled', False)))
                     except Exception:
                         pass
                     try:
@@ -1816,6 +1894,20 @@ class UniversalEmailCleanerApp:
             'source_type': self.source_type_var.get(),
             'csv_path': self.csv_path_var.get(),
             'target_single_email': self.target_single_email_var.get(),
+            'criteria_msg_id': self.criteria_msg_id.get(),
+            'criteria_goid': self.criteria_goid.get(),
+            'criteria_clean_goid': self.criteria_clean_goid.get(),
+            'criteria_subject': self.criteria_subject.get(),
+            'criteria_sender': self.criteria_sender.get(),
+            'criteria_attendee': self.criteria_attendee.get(),
+            'criteria_recipient': self.criteria_recipient.get(),
+            'criteria_has_attachments': bool(self.criteria_has_attachments.get()),
+            'criteria_body': self.criteria_body.get(),
+            'criteria_start_date': self.criteria_start_date.get(),
+            'criteria_end_date': self.criteria_end_date.get(),
+            'cleanup_target': self.cleanup_target_var.get(),
+            'meeting_scope': self.meeting_scope_var.get(),
+            'meeting_only_cancelled': bool(self.meeting_only_cancelled_var.get()),
             'mail_folder_scope': '',
             'folder_selections': {k: bool(v.get()) for k, v in self._folder_selections.items()},
             'search_detail': self.search_detail_var.get(),
@@ -2474,7 +2566,8 @@ class UniversalEmailCleanerApp:
         # Pack later if needed or pack and hide
         
         ttk.Label(self.meeting_opt_frame, text="循环类型:").pack(side="left", padx=5)
-        ttk.Combobox(self.meeting_opt_frame, textvariable=self.meeting_scope_var, values=["所有 (All)", "仅单次 (Single Instance)", "仅系列主会议 (Series Master)"], state="readonly", width=25).pack(side="left", padx=5)
+        self.meeting_scope_cb = ttk.Combobox(self.meeting_opt_frame, textvariable=self.meeting_scope_var, values=["所有 (All)", "仅单次 (Single Instance)", "仅系列主会议 (Series Master)"], state="readonly", width=25)
+        self.meeting_scope_cb.pack(side="left", padx=5)
         
         ttk.Checkbutton(self.meeting_opt_frame, text="仅处理已取消 (IsCancelled Only)", variable=self.meeting_only_cancelled_var).pack(side="left", padx=15)
 
@@ -2484,8 +2577,13 @@ class UniversalEmailCleanerApp:
         
         grid_opts = {'padx': 5, 'pady': 2, 'sticky': 'w'}
         
-        ttk.Label(self.filter_frame, text="Message ID:").grid(row=0, column=0, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_msg_id, width=30).grid(row=0, column=1, **grid_opts)
+        self.lbl_primary_id = ttk.Label(self.filter_frame, text="Message ID:")
+        self.lbl_primary_id.grid(row=0, column=0, **grid_opts)
+        self.entry_primary_id = ttk.Entry(self.filter_frame, textvariable=self.criteria_msg_id, width=30)
+        self.entry_primary_id.grid(row=0, column=1, **grid_opts)
+
+        self.lbl_secondary_id = ttk.Label(self.filter_frame, text="CleanGOID:")
+        self.entry_secondary_id = ttk.Entry(self.filter_frame, textvariable=self.criteria_clean_goid, width=30)
         
         self.lbl_subject = ttk.Label(self.filter_frame, text="主题包含:")
         self.lbl_subject.grid(row=1, column=0, **grid_opts)
@@ -2493,7 +2591,16 @@ class UniversalEmailCleanerApp:
         
         self.lbl_sender = ttk.Label(self.filter_frame, text="发件人地址:")
         self.lbl_sender.grid(row=1, column=2, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_sender, width=30).grid(row=1, column=3, **grid_opts)
+        self.entry_sender = ttk.Entry(self.filter_frame, textvariable=self.criteria_sender, width=30)
+        self.entry_sender.grid(row=1, column=3, **grid_opts)
+
+        self.lbl_extra_addr = ttk.Label(self.filter_frame, text="收件人地址包含:")
+        self.lbl_extra_addr.grid(row=3, column=0, **grid_opts)
+        self.entry_extra_addr = ttk.Entry(self.filter_frame, textvariable=self.criteria_recipient, width=30)
+        self.entry_extra_addr.grid(row=3, column=1, **grid_opts)
+
+        self.chk_filter_has_attachments = ttk.Checkbutton(self.filter_frame, text="仅包含附件", variable=self.criteria_has_attachments)
+        self.chk_filter_has_attachments.grid(row=3, column=2, columnspan=2, **grid_opts)
 
         ttk.Label(self.filter_frame, text="开始日期 (YYYY-MM-DD):").grid(row=2, column=0, **grid_opts)
         self.start_date_entry = DateEntry(self.filter_frame, textvariable=self.criteria_start_date, mode_var=self.cleanup_target_var, other_date_var=self.criteria_end_date)
@@ -2507,11 +2614,17 @@ class UniversalEmailCleanerApp:
             self.filter_frame,
             text="提示：会议不填写日期范围则不展开循环实例；填写开始+结束日期后，Graph/EWS 都会在该范围内展开循环会议 occurrence/exception。"
         )
-        self.meeting_date_hint_label.grid(row=3, column=0, columnspan=4, padx=5, pady=(2, 0), sticky='w')
+        self.meeting_date_hint_label.grid(row=4, column=0, columnspan=4, padx=5, pady=(2, 0), sticky='w')
 
         self.lbl_body = ttk.Label(self.filter_frame, text="正文包含:")
-        self.lbl_body.grid(row=4, column=0, **grid_opts)
-        ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80).grid(row=4, column=1, columnspan=3, **grid_opts)
+        self.lbl_body.grid(row=5, column=0, **grid_opts)
+        self.entry_body = ttk.Entry(self.filter_frame, textvariable=self.criteria_body, width=80)
+        self.entry_body.grid(row=5, column=1, columnspan=3, **grid_opts)
+
+        try:
+            self.meeting_scope_var.trace_add('write', lambda *_args: self._update_criteria_ui())
+        except Exception:
+            pass
 
         self.update_ui_for_target() # Init state
 
@@ -2605,7 +2718,8 @@ class UniversalEmailCleanerApp:
         ttk.Label(opt_frame, text="| 文件夹范围(Email):").pack(side="left", padx=5)
 
         self._folder_summary_var = tk.StringVar(value=self._get_folder_summary_text())
-        ttk.Button(opt_frame, text="选择文件夹...", command=self._on_folder_picker_click, width=14).pack(side="left", padx=2)
+        self._btn_folder_picker = ttk.Button(opt_frame, text="选择文件夹...", command=self._on_folder_picker_click, width=14)
+        self._btn_folder_picker.pack(side="left", padx=2)
         self._folder_summary_lbl = ttk.Label(opt_frame, textvariable=self._folder_summary_var, foreground="gray", width=30)
         self._folder_summary_lbl.pack(side="left", padx=2)
         _add_combobox_tooltip(self._folder_summary_lbl, self._folder_summary_var)
@@ -2614,12 +2728,19 @@ class UniversalEmailCleanerApp:
         opt_frame2 = ttk.Frame(frame)
         opt_frame2.pack(fill="x", pady=2)
 
-        ttk.Label(opt_frame2, text="搜索详细程度:").pack(side="left", padx=(0, 5))
-        ttk.Radiobutton(opt_frame2, text="轻量 (Lite)", variable=self.search_detail_var, value="lite").pack(side="left", padx=3)
-        ttk.Radiobutton(opt_frame2, text="默认-完整 (Default)", variable=self.search_detail_var, value="default").pack(side="left", padx=3)
-        ttk.Radiobutton(opt_frame2, text="自定义 (Custom)", variable=self.search_detail_var, value="custom").pack(side="left", padx=3)
-        ttk.Button(opt_frame2, text="自定义字段...", command=self._show_result_fields_picker, width=14).pack(side="left", padx=5)
-        ttk.Label(opt_frame2, text="(轻量模式仅搜基础字段，速度更快)", foreground="gray").pack(side="left", padx=5)
+        self._lbl_search_detail = ttk.Label(opt_frame2, text="搜索详细程度:")
+        self._lbl_search_detail.pack(side="left", padx=(0, 5))
+        self._rb_search_lite = ttk.Radiobutton(opt_frame2, text="轻量 (Lite)", variable=self.search_detail_var, value="lite")
+        self._rb_search_lite.pack(side="left", padx=3)
+        self._rb_search_default = ttk.Radiobutton(opt_frame2, text="默认-完整 (Default)", variable=self.search_detail_var, value="default")
+        self._rb_search_default.pack(side="left", padx=3)
+        self._rb_search_custom = ttk.Radiobutton(opt_frame2, text="自定义 (Custom)", variable=self.search_detail_var, value="custom")
+        self._rb_search_custom.pack(side="left", padx=3)
+        self._btn_result_fields = ttk.Button(opt_frame2, text="自定义字段...", command=self._show_result_fields_picker, width=14)
+        self._btn_result_fields.pack(side="left", padx=5)
+        self._search_detail_hint_var = tk.StringVar(value="(轻量模式仅搜基础字段，速度更快)")
+        self._lbl_search_detail_hint = ttk.Label(opt_frame2, textvariable=self._search_detail_hint_var, foreground="gray")
+        self._lbl_search_detail_hint.pack(side="left", padx=5)
         
         # Start
         ttk.Button(frame, textvariable=self.btn_start_text, command=self.start_cleanup_thread).pack(pady=10, ipadx=20, ipady=5)
@@ -2659,6 +2780,17 @@ class UniversalEmailCleanerApp:
 
         self._btn_delete_selected = ttk.Button(toolbar, text="删除选中项", command=self._delete_selected_results)
         self._btn_delete_selected.pack(side="left", padx=2)
+
+        ttk.Label(toolbar, text="操作:").pack(side="left", padx=(8, 2))
+        self._results_action_var = tk.StringVar(value="删除 (Delete)")
+        self._results_action_cb = ttk.Combobox(
+            toolbar,
+            textvariable=self._results_action_var,
+            values=["删除 (Delete)", "取消会议 (Cancel)", "拒绝会议 (Decline)"],
+            state="readonly",
+            width=18,
+        )
+        self._results_action_cb.pack(side="left", padx=(0, 2))
 
         # Delete mode indicator — synced from task config page
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -2725,6 +2857,8 @@ class UniversalEmailCleanerApp:
         "End": (170, False),
         "Type": (80, False),
         "MessageId": (280, True),
+        "MeetingGOID": (260, True),
+        "CleanGOID": (260, True),
         "HasAttachments": (120, False),
         "Size": (110, False),
         "Details": (260, True),
@@ -2740,19 +2874,23 @@ class UniversalEmailCleanerApp:
     # Columns to hide from Treeview display (still kept in CSV)
     _HIDDEN_COLS = {
         "Action", "Status", "ItemId",
-        "MeetingGOID", "CleanGOID", "iCalUId", "SeriesMasterId",
+        "iCalUId", "SeriesMasterId",
     }
 
     def _populate_results_tree(self, columns: list[str], rows: list[dict]):
         """Fill the results Treeview with data."""
-        if 'SMTPAddress' in columns:
-            try:
-                rows = sorted(rows, key=lambda r: str(r.get('SMTPAddress', '') or '').lower())
-            except Exception:
-                pass
         self._scan_results_columns = columns
-        self._scan_results_data = rows
         self._scan_checked.clear()
+
+        is_meeting_report = ('MeetingGOID' in columns) or ('UserRole' in columns and 'Organizer' in columns)
+        try:
+            if is_meeting_report:
+                self._results_action_cb.configure(values=["删除 (Delete)", "取消会议 (Cancel)", "拒绝会议 (Decline)"], state="readonly")
+            else:
+                self._results_action_cb.configure(values=["删除 (Delete)"], state="readonly")
+                self._results_action_var.set("删除 (Delete)")
+        except Exception:
+            pass
 
         # Clear old data
         for item in self.results_tree.get_children():
@@ -2761,9 +2899,40 @@ class UniversalEmailCleanerApp:
         # Filter out hidden columns for display
         visible_cols = [c for c in columns if c not in self._HIDDEN_COLS]
 
+        # 单用户不显示 SMTP/UPN；多用户仅显示 CSV 对应的一列（SMTP 或 UPN）
+        identity_cols = [c for c in ("SMTPAddress", "UserPrincipalName") if c in visible_cols]
+        if identity_cols:
+            unique_users = set()
+            for row in rows:
+                user_key = str(row.get('SMTPAddress') or row.get('UserPrincipalName') or '').strip().lower()
+                if user_key:
+                    unique_users.add(user_key)
+            is_multi_user = len(unique_users) > 1
+
+            preferred_identity_col = self._target_identity_column if self._target_identity_column in identity_cols else None
+            if preferred_identity_col is None:
+                smtp_count = sum(1 for r in rows if str(r.get('SMTPAddress') or '').strip())
+                upn_count = sum(1 for r in rows if str(r.get('UserPrincipalName') or '').strip())
+                if 'SMTPAddress' in identity_cols and smtp_count > upn_count:
+                    preferred_identity_col = 'SMTPAddress'
+                elif 'UserPrincipalName' in identity_cols:
+                    preferred_identity_col = 'UserPrincipalName'
+                else:
+                    preferred_identity_col = identity_cols[0]
+
+            if is_multi_user:
+                visible_cols = [c for c in visible_cols if c not in {'SMTPAddress', 'UserPrincipalName'} or c == preferred_identity_col]
+                try:
+                    rows = sorted(rows, key=lambda r: str(r.get(preferred_identity_col, '') or '').lower())
+                except Exception:
+                    pass
+            else:
+                visible_cols = [c for c in visible_cols if c not in {'SMTPAddress', 'UserPrincipalName'}]
+
         # Setup columns: ☑ + visible data columns
         display_cols = ["☑"] + visible_cols
         self.results_tree["columns"] = display_cols
+        self._scan_results_data = rows
 
         # ☑ column
         self.results_tree.heading("☑", text="☑", command=self._toggle_all_results)
@@ -2782,8 +2951,52 @@ class UniversalEmailCleanerApp:
             self._scan_checked[iid] = False
 
         count = len(rows)
-        self._results_info_var.set(f"共 {count} 条结果。可勾选后点「删除选中项」进行删除。")
+        self._results_info_var.set(f"共 {count} 条结果。可勾选后选择操作后执行。")
         self._results_count_var.set(f"已选: 0 / {count}")
+        self._refresh_results_action_options()
+
+    def _refresh_results_action_options(self):
+        """Adjust results action list based on meeting roles in current selection."""
+        try:
+            is_meeting_report = ('MeetingGOID' in self._scan_results_columns) or ('UserRole' in self._scan_results_columns and 'Organizer' in self._scan_results_columns)
+            if not is_meeting_report:
+                self._results_action_cb.configure(values=["删除 (Delete)"], state="readonly")
+                self._results_action_var.set("删除 (Delete)")
+                return
+
+            selected_iids = [iid for iid, checked in self._scan_checked.items() if checked]
+            source_rows = []
+            if selected_iids:
+                for iid in selected_iids:
+                    try:
+                        source_rows.append(self._scan_results_data[int(iid)])
+                    except Exception:
+                        pass
+            else:
+                source_rows = list(self._scan_results_data)
+
+            roles = {
+                str((row or {}).get('UserRole', '') or '').strip().lower()
+                for row in source_rows
+                if str((row or {}).get('UserRole', '') or '').strip()
+            }
+
+            values = ["删除 (Delete)"]
+            if not roles:
+                values.extend(["取消会议 (Cancel)", "拒绝会议 (Decline)"])
+            elif roles == {"organizer"}:
+                values.append("取消会议 (Cancel)")
+            elif roles == {"attendee"}:
+                values.append("拒绝会议 (Decline)")
+            else:
+                values.extend(["取消会议 (Cancel)", "拒绝会议 (Decline)"])
+
+            current = self._results_action_var.get()
+            self._results_action_cb.configure(values=values, state="readonly")
+            if current not in values:
+                self._results_action_var.set(values[0])
+        except Exception:
+            pass
 
     def _sort_results_by(self, col: str):
         """Sort treeview rows by a column (toggle asc/desc)."""
@@ -2826,6 +3039,7 @@ class UniversalEmailCleanerApp:
         total = len(self._scan_checked)
         selected = sum(1 for v in self._scan_checked.values() if v)
         self._results_count_var.set(f"已选: {selected} / {total}")
+        self._refresh_results_action_options()
 
     def _select_all_results(self):
         for iid in self.results_tree.get_children():
@@ -2930,52 +3144,66 @@ class UniversalEmailCleanerApp:
         return 'normal'
 
     def _delete_selected_results(self):
-        """Delete the checked items via Graph or EWS."""
+        """Execute selected action on checked items via Graph or EWS."""
         selected_iids = [iid for iid, checked in self._scan_checked.items() if checked]
         if not selected_iids:
             messagebox.showinfo("提示", "未选中任何项目。请先勾选要删除的项目。")
             return
 
         count = len(selected_iids)
-        mode = self._results_del_mode_var.get()
-        warn = ""
-        if "彻底" in mode:
-            warn = "\n\n⚠️ 当前为【彻底删除】模式，邮件将永久删除，不可恢复！"
-        elif "软删除" in mode:
-            warn = "\n\n当前为【软删除】模式，邮件进入 Recoverable Items（管理员可通过 eDiscovery 恢复）。"
+        action = self._results_action_var.get()
+
+        if "取消会议" in action:
+            title = "确认取消会议"
+            warn = "\n\n仅会对 UserRole=Organizer 的会议执行取消。"
+            confirm_text = f"即将对 {count} 个选中项目执行【取消会议】。{warn}\n\n是否继续？"
+        elif "拒绝会议" in action:
+            title = "确认拒绝会议"
+            warn = "\n\n仅会对 UserRole=Attendee 的会议执行拒绝。"
+            confirm_text = f"即将对 {count} 个选中项目执行【拒绝会议】。{warn}\n\n是否继续？"
         else:
-            warn = "\n\n当前为【普通删除】模式，邮件移至 Deleted Items（用户可手动恢复）。"
-        confirm = messagebox.askyesno("确认删除", f"即将删除 {count} 个选中项目。{warn}\n\n是否继续？")
+            mode = self._results_del_mode_var.get()
+            warn = ""
+            if "彻底" in mode:
+                warn = "\n\n⚠️ 当前为【彻底删除】模式，邮件将永久删除，不可恢复！"
+            elif "软删除" in mode:
+                warn = "\n\n当前为【软删除】模式，邮件进入 Recoverable Items（管理员可通过 eDiscovery 恢复）。"
+            else:
+                warn = "\n\n当前为【普通删除】模式，邮件移至 Deleted Items（用户可手动恢复）。"
+            title = "确认删除"
+            confirm_text = f"即将删除 {count} 个选中项目。{warn}\n\n是否继续？"
+
+        confirm = messagebox.askyesno(title, confirm_text)
         if not confirm:
             return
 
         source = self.source_type_var.get()
         self._btn_delete_selected.configure(state="disabled")
-        threading.Thread(target=self._do_delete_selected, args=(selected_iids, source), daemon=True).start()
+        threading.Thread(target=self._do_delete_selected, args=(selected_iids, source, action), daemon=True).start()
 
-    def _do_delete_selected(self, selected_iids: list[str], source: str):
-        """Background thread: delete selected items."""
+    def _do_delete_selected(self, selected_iids: list[str], source: str, action: str):
+        """Background thread: execute selected action on checked items."""
         total = len(selected_iids)
-        self.log(f">>> 开始删除 {total} 个选中项目 ({source})...")
+        self.log(f">>> 开始执行操作: {action} | 选中 {total} 项 ({source})...")
         success = 0
         fail = 0
 
         try:
             if source == "Graph":
-                success, fail = self._do_delete_graph(selected_iids)
+                success, fail = self._do_delete_graph(selected_iids, action)
             elif source == "EWS":
-                success, fail = self._do_delete_ews(selected_iids)
+                success, fail = self._do_delete_ews(selected_iids, action)
         except Exception as e:
             self.log(f"删除过程出错: {e}", "ERROR")
         finally:
             self.root.after(0, lambda: self._btn_delete_selected.configure(state="normal"))
 
-        self.log(f">>> 删除完成。成功: {success}, 失败: {fail}")
+        self.log(f">>> 操作完成。成功: {success}, 失败: {fail}")
         self._update_selection_count()
-        self.root.after(0, lambda s=success, f=fail: messagebox.showinfo("完成", f"删除完成。\n成功: {s}\n失败: {f}"))
+        self.root.after(0, lambda s=success, f=fail: messagebox.showinfo("完成", f"操作完成。\n成功: {s}\n失败: {f}"))
 
-    def _do_delete_graph(self, selected_iids: list[str]) -> tuple[int, int]:
-        """Delete selected items via Graph API. Respects delete mode. Returns (success, fail)."""
+    def _do_delete_graph(self, selected_iids: list[str], action: str = "删除 (Delete)") -> tuple[int, int]:
+        """Execute selected action via Graph API. Returns (success, fail)."""
         auth_mode = self.graph_auth_mode_var.get()
         tenant_id = self.tenant_id_var.get()
         app_id = self.app_id_var.get()
@@ -3009,28 +3237,65 @@ class UniversalEmailCleanerApp:
                 item_type = row.get("Type", "Email")
                 resource = "events" if item_type not in ("Email", "") else "messages"
                 base_url = f"{graph_endpoint}/v1.0/users/{user}/{resource}/{item_id}"
+                role = str(row.get("UserRole", "") or "").strip().lower()
 
                 resp = None
-                if del_mode == "permanent" and resource == "messages":
-                    # POST .../permanentDelete — 永久删除
-                    resp = requests.post(f"{base_url}/permanentDelete", headers=headers, timeout=30)
-                    if resp.status_code in (404, 405):
-                        resp = requests.delete(base_url, headers=headers, timeout=30)
-                elif del_mode == "soft" and resource == "messages":
-                    # 软删除: DELETE 请求 — 进入 Recoverable Items
-                    resp = requests.delete(base_url, headers=headers, timeout=30)
+                if "取消会议" in action:
+                    if resource != "events":
+                        fail += 1
+                        self._update_result_row_status(iid, "Skipped (NotMeeting)", "error")
+                        continue
+                    if role != "organizer":
+                        fail += 1
+                        self._update_result_row_status(iid, "Skipped (NotOrganizer)", "error")
+                        continue
+                    resp = requests.post(
+                        f"{base_url}/cancel",
+                        headers=headers,
+                        json={"comment": "Cancelled by UniversalEmailCleaner"},
+                        timeout=30,
+                    )
+                elif "拒绝会议" in action:
+                    if resource != "events":
+                        fail += 1
+                        self._update_result_row_status(iid, "Skipped (NotMeeting)", "error")
+                        continue
+                    if role != "attendee":
+                        fail += 1
+                        self._update_result_row_status(iid, "Skipped (NotAttendee)", "error")
+                        continue
+                    resp = requests.post(
+                        f"{base_url}/decline",
+                        headers=headers,
+                        json={"comment": "Declined by UniversalEmailCleaner", "sendResponse": True},
+                        timeout=30,
+                    )
                 else:
-                    # 普通删除: POST .../move → Deleted Items
-                    if resource == "messages":
-                        resp = requests.post(f"{base_url}/move", headers=headers, json={"destinationId": "deleteditems"}, timeout=30)
-                        if resp is not None and resp.status_code in (404, 405):
+                    if del_mode == "permanent" and resource == "messages":
+                        # POST .../permanentDelete — 永久删除
+                        resp = requests.post(f"{base_url}/permanentDelete", headers=headers, timeout=30)
+                        if resp.status_code in (404, 405):
                             resp = requests.delete(base_url, headers=headers, timeout=30)
-                    else:
+                    elif del_mode == "soft" and resource == "messages":
+                        # 软删除: DELETE 请求 — 进入 Recoverable Items
                         resp = requests.delete(base_url, headers=headers, timeout=30)
+                    else:
+                        # 普通删除: POST .../move → Deleted Items
+                        if resource == "messages":
+                            resp = requests.post(f"{base_url}/move", headers=headers, json={"destinationId": "deleteditems"}, timeout=30)
+                            if resp is not None and resp.status_code in (404, 405):
+                                resp = requests.delete(base_url, headers=headers, timeout=30)
+                        else:
+                            resp = requests.delete(base_url, headers=headers, timeout=30)
 
                 if resp is not None and resp.status_code in (200, 201, 202, 204):
                     success += 1
-                    status_txt = "PermanentDeleted" if del_mode == "permanent" else ("SoftDeleted" if del_mode == "soft" else "Deleted")
+                    if "取消会议" in action:
+                        status_txt = "Cancelled"
+                    elif "拒绝会议" in action:
+                        status_txt = "Declined"
+                    else:
+                        status_txt = "PermanentDeleted" if del_mode == "permanent" else ("SoftDeleted" if del_mode == "soft" else "Deleted")
                     self._update_result_row_status(iid, status_txt, "success")
                 else:
                     fail += 1
@@ -3046,8 +3311,8 @@ class UniversalEmailCleanerApp:
 
         return success, fail
 
-    def _do_delete_ews(self, selected_iids: list[str]) -> tuple[int, int]:
-        """Delete selected items via EWS. Returns (success, fail)."""
+    def _do_delete_ews(self, selected_iids: list[str], action: str = "删除 (Delete)") -> tuple[int, int]:
+        """Execute selected action via EWS. Returns (success, fail)."""
         creds, token = self._get_ews_credentials()
         if creds is None and token:
             self.log("EWS Token 模式下暂不支持从扫描结果删除，请使用 NTLM/Basic/OAuth2 模式。", "ERROR")
@@ -3092,6 +3357,47 @@ class UniversalEmailCleanerApp:
                     account = Account(primary_smtp_address=target_email, config=config, autodiscover=False, access_type=access_type_val)
 
                 self.log(f"  已连接邮箱: {target_email} ({len(items_list)} 项待删除)")
+
+                if "取消会议" in action or "拒绝会议" in action:
+                    for iid, row in items_list:
+                        try:
+                            item_id = row.get("ItemId", "") or row.get("MessageId", "")
+                            if not item_id:
+                                fail += 1
+                                self._update_result_row_status(iid, "No ID", "error")
+                                continue
+
+                            role = str(row.get("UserRole", "") or "").strip().lower()
+                            item = account.calendar.get(id=item_id)
+
+                            if "取消会议" in action:
+                                if role != "organizer":
+                                    fail += 1
+                                    self._update_result_row_status(iid, "Skipped (NotOrganizer)", "error")
+                                    continue
+                                try:
+                                    item.cancel()
+                                except TypeError:
+                                    item.cancel(body="Cancelled by UniversalEmailCleaner")
+                                success += 1
+                                self._update_result_row_status(iid, "Cancelled", "success")
+                            else:
+                                if role != "attendee":
+                                    fail += 1
+                                    self._update_result_row_status(iid, "Skipped (NotAttendee)", "error")
+                                    continue
+                                try:
+                                    item.decline()
+                                except TypeError:
+                                    item.decline(message_body="Declined by UniversalEmailCleaner")
+                                success += 1
+                                self._update_result_row_status(iid, "Declined", "success")
+
+                        except Exception as ex_action:
+                            fail += 1
+                            self._update_result_row_status(iid, "Failed", "error")
+                            self.log(f"  EWS 会议操作失败: {ex_action}", "ERROR")
+                    continue
 
                 # Collect EWS item IDs for bulk delete
                 batch_ids = []
@@ -3198,6 +3504,19 @@ class UniversalEmailCleanerApp:
             self.lbl_body.config(text="会议内容包含:")
             if hasattr(self, 'meeting_date_hint_label'):
                 self.meeting_date_hint_label.grid()
+
+            try:
+                self._btn_folder_picker.configure(state="disabled")
+                self._folder_summary_var.set("会议扫描不适用文件夹")
+                self.search_detail_var.set("default")
+                self._rb_search_lite.configure(state="disabled")
+                self._rb_search_default.configure(state="disabled")
+                self._rb_search_custom.configure(state="disabled")
+                self._btn_result_fields.configure(state="disabled")
+                self._search_detail_hint_var.set("(会议扫描使用固定字段，搜索详细度不适用)")
+            except Exception:
+                pass
+            self._update_criteria_ui()
         else:
             self.meeting_opt_frame.pack_forget()
             self.lbl_subject.config(text="邮件主题包含:")
@@ -3209,8 +3528,47 @@ class UniversalEmailCleanerApp:
             try:
                 self.chk_permanent_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
                 self.chk_soft_delete.configure(state="disabled" if self.report_only_var.get() else "normal")
+                self._btn_folder_picker.configure(state="normal")
+                self._folder_summary_var.set(self._get_folder_summary_text())
+                self._rb_search_lite.configure(state="normal")
+                self._rb_search_default.configure(state="normal")
+                self._rb_search_custom.configure(state="normal")
+                self._btn_result_fields.configure(state="normal")
+                self._search_detail_hint_var.set("(轻量模式仅搜基础字段，速度更快)")
             except Exception:
                 pass
+            self._update_criteria_ui()
+
+    def _update_criteria_ui(self):
+        """Update filter controls according to Email/Meeting target and meeting scope."""
+        try:
+            target = self.cleanup_target_var.get()
+            if target == "Meeting":
+                self.lbl_primary_id.config(text="GOID:")
+                self.entry_primary_id.configure(textvariable=self.criteria_goid)
+                self.lbl_extra_addr.config(text="与会者包含地址:")
+                self.entry_extra_addr.configure(textvariable=self.criteria_attendee)
+                self.chk_filter_has_attachments.grid_remove()
+
+                scope = self.meeting_scope_var.get()
+                show_clean = "Single" not in scope
+                if show_clean:
+                    self.lbl_secondary_id.grid(row=0, column=2, padx=5, pady=2, sticky='w')
+                    self.entry_secondary_id.grid(row=0, column=3, padx=5, pady=2, sticky='w')
+                else:
+                    self.lbl_secondary_id.grid_remove()
+                    self.entry_secondary_id.grid_remove()
+                    self.criteria_clean_goid.set('')
+            else:
+                self.lbl_primary_id.config(text="Message ID:")
+                self.entry_primary_id.configure(textvariable=self.criteria_msg_id)
+                self.lbl_secondary_id.grid_remove()
+                self.entry_secondary_id.grid_remove()
+                self.lbl_extra_addr.config(text="收件人地址包含:")
+                self.entry_extra_addr.configure(textvariable=self.criteria_recipient)
+                self.chk_filter_has_attachments.grid(row=3, column=2, columnspan=2, padx=5, pady=2, sticky='w')
+        except Exception:
+            pass
 
     def start_cleanup_thread(self):
         if (not self.csv_path_var.get()) and (not (self.target_single_email_var.get() or '').strip()):
@@ -3364,34 +3722,46 @@ class UniversalEmailCleanerApp:
     def _get_target_users(self):
         single = (self.target_single_email_var.get() or '').strip()
         if single:
+            self._target_identity_column = None
             if self.csv_path_var.get():
                 self.log("检测到单个目标邮箱已填写，将忽略 CSV 列表。", is_advanced=True)
             return [single]
 
         csv_path = self.csv_path_var.get()
         if not csv_path:
+            self._target_identity_column = None
             return []
 
         users = []
-        # Support both CSV (with UserPrincipalName header) and plain text (one email per line)
+        self._target_identity_column = None
+        # Support CSV (UserPrincipalName/UPN/SMTPAddress) and plain text (one email per line)
         try:
-            with open(csv_path, 'r', encoding='utf-8-sig') as f:
-                first_line = f.readline().strip()
-            if 'UserPrincipalName' in first_line:
-                # CSV with header
-                with open(csv_path, 'r', encoding='utf-8-sig') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        key = next((k for k in row.keys() if 'UserPrincipalName' in k), None)
-                        if key and row.get(key):
-                            users.append(row[key].strip())
-            else:
-                # Plain text: one email per line
-                with open(csv_path, 'r', encoding='utf-8-sig') as f:
-                    for line in f:
-                        email = line.strip()
-                        if email and '@' in email:
-                            users.append(email)
+            with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                headers = reader.fieldnames or []
+
+                if headers:
+                    smtp_key = next((h for h in headers if str(h).strip().lower() in {'smtpaddress', 'smtp', 'mail', 'email'}), None)
+                    upn_key = next((h for h in headers if str(h).strip().lower() in {'userprincipalname', 'upn'}), None)
+                    use_key = smtp_key or upn_key
+
+                    if use_key:
+                        self._target_identity_column = 'SMTPAddress' if use_key == smtp_key else 'UserPrincipalName'
+                        for row in reader:
+                            val = (row.get(use_key) or '').strip()
+                            if val:
+                                users.append(val)
+                    else:
+                        # Not a recognized mailbox CSV, fallback to plain-text mode
+                        headers = []
+
+                if not headers:
+                    with open(csv_path, 'r', encoding='utf-8-sig') as tf:
+                        for line in tf:
+                            email = line.strip()
+                            if email and '@' in email:
+                                users.append(email)
+                    self._target_identity_column = 'UserPrincipalName'
         except Exception as e:
             self.log(f"读取用户列表文件失败: {e}", "ERROR")
         return users
@@ -3613,6 +3983,11 @@ class UniversalEmailCleanerApp:
                                   permanent_delete: bool = False, soft_delete: bool = False):
         self.log(f"--- 正在处理: {user} ---")
         try:
+            criteria_goid = (self.criteria_goid.get() or '').strip()
+            criteria_clean_goid = (self.criteria_clean_goid.get() or '').strip().lower()
+            criteria_attendee = (self.criteria_attendee.get() or '').strip().lower()
+            criteria_recipient = (self.criteria_recipient.get() or '').strip().lower()
+            criteria_has_attachments = bool(self.criteria_has_attachments.get())
             req_headers = dict(headers)
             session = _get_pooled_session()
 
@@ -3804,12 +4179,14 @@ class UniversalEmailCleanerApp:
 
                     # Email listing can be chatty; reduce payload when possible.
                     select_parts = ["id", "subject", "from", "receivedDateTime", "parentFolderId"]
-                    if "HasAttachments" in selected_result_fields_set:
+                    if "HasAttachments" in selected_result_fields_set or criteria_has_attachments:
                         select_parts.append("hasAttachments")
                     if "Size" in selected_result_fields_set:
                         select_parts.append("size")
                     if "MessageId" in selected_result_fields_set:
                         select_parts.append("internetMessageId")
+                    if criteria_recipient:
+                        select_parts.append("toRecipients")
                     if body_keyword:
                         select_parts.append("body")
                     select_fields = ",".join(select_parts)
@@ -3876,6 +4253,18 @@ class UniversalEmailCleanerApp:
                                         should_delete = False
 
                                 if should_delete:
+                                    if criteria_has_attachments and not bool(item.get('hasAttachments', False)):
+                                        continue
+
+                                    if criteria_recipient:
+                                        recipients = []
+                                        for rec in (item.get('toRecipients') or []):
+                                            addr = ((rec.get('emailAddress') or {}).get('address') or '').strip()
+                                            if addr:
+                                                recipients.append(addr)
+                                        if not any(criteria_recipient in addr.lower() for addr in recipients):
+                                            continue
+
                                     item_id = item['id']
                                     subject = item.get('subject', '无主题')
                                     sender = item.get('from', {}).get('emailAddress', {}).get('address', '未知')
@@ -4182,6 +4571,13 @@ class UniversalEmailCleanerApp:
                             meeting_goid = ical_uid or ''
                             clean_goid = (meeting_goid or item_id).strip().lower()
 
+                            if criteria_goid and criteria_goid.lower() not in meeting_goid.lower():
+                                continue
+                            if criteria_clean_goid and criteria_clean_goid not in clean_goid:
+                                continue
+                            if criteria_attendee and not any(criteria_attendee in addr.lower() for addr in attendee_emails):
+                                continue
+
                             details_hint = ''
                             if goid_b64 or goid_hex:
                                 details_hint = f"GOID(b64)={goid_b64}; GOID(hex)={goid_hex}".strip('; ')
@@ -4406,6 +4802,7 @@ class UniversalEmailCleanerApp:
                     delete_resource = "messages"
                     if self.criteria_msg_id.get(): filters.append(f"internetMessageId eq '{self.criteria_msg_id.get()}'")
                     if self.criteria_sender.get(): filters.append(f"from/emailAddress/address eq '{self.criteria_sender.get()}'")
+                    if self.criteria_has_attachments.get(): filters.append("hasAttachments eq true")
                     if start_date: filters.append(f"receivedDateTime ge {start_date}T00:00:00Z")
                     if end_date: filters.append(f"receivedDateTime le {end_date}T23:59:59Z")
                 else: # Meeting
@@ -4503,6 +4900,11 @@ class UniversalEmailCleanerApp:
                                 access_token: str | None = None):
         try:
             self.log(f"--- 正在处理: {target_email} ---")
+            criteria_goid = (self.criteria_goid.get() or '').strip().lower()
+            criteria_clean_goid = (self.criteria_clean_goid.get() or '').strip().lower()
+            criteria_attendee = (self.criteria_attendee.get() or '').strip().lower()
+            criteria_recipient = (self.criteria_recipient.get() or '').strip().lower()
+            criteria_has_attachments = bool(self.criteria_has_attachments.get())
             
             # Build Account — support Basic credentials or OAuth2/Token
             access_type_val = IMPERSONATION if auth_type == "Impersonation" else DELEGATE
@@ -4685,8 +5087,10 @@ class UniversalEmailCleanerApp:
                         fields = ['id', 'changekey', 'subject', 'sender', 'datetime_received']
                         if 'MessageId' in selected_result_fields_set:
                             fields.append('message_id')
-                        if 'HasAttachments' in selected_result_fields_set:
+                        if 'HasAttachments' in selected_result_fields_set or criteria_has_attachments:
                             fields.append('has_attachments')
+                        if criteria_recipient:
+                            fields.append('to_recipients')
                         if 'Size' in selected_result_fields_set:
                             fields.append('size')
                         if criteria_body:
@@ -4702,6 +5106,20 @@ class UniversalEmailCleanerApp:
                                     if criteria_body.lower() not in (item.body or "").lower():
                                         continue
                                 except Exception:
+                                    continue
+                            if criteria_has_attachments and not bool(getattr(item, 'has_attachments', False)):
+                                continue
+                            if criteria_recipient:
+                                to_recipients = []
+                                try:
+                                    for r in (getattr(item, 'to_recipients', None) or []):
+                                        if getattr(r, 'email_address', None):
+                                            to_recipients.append(r.email_address)
+                                        elif getattr(getattr(r, 'mailbox', None), 'email_address', None):
+                                            to_recipients.append(r.mailbox.email_address)
+                                except Exception:
+                                    to_recipients = []
+                                if not any(criteria_recipient in str(addr).lower() for addr in to_recipients):
                                     continue
 
                             item_id = getattr(item, 'id', None) or (item.item_id if hasattr(item, 'item_id') else getattr(item, 'message_id', 'Unknown ID'))
@@ -4774,7 +5192,7 @@ class UniversalEmailCleanerApp:
             is_calendar_view = (target_type == "Meeting" and (start_dt or end_dt))
 
             if not is_calendar_view:
-                if criteria_msg_id:
+                if target_type != "Meeting" and criteria_msg_id:
                     qs = qs.filter(message_id=criteria_msg_id)
                 if criteria_subject:
                     qs = qs.filter(subject__icontains=criteria_subject)
@@ -4858,7 +5276,7 @@ class UniversalEmailCleanerApp:
                     m_uid = getattr(item, 'uid', '')
                     m_recurring_master_id = getattr(item, 'recurring_master_id', None)
                     m_goid = m_uid
-                    m_clean_goid = m_goid 
+                    m_clean_goid = (m_goid or item_id or '').strip().lower()
                     m_organizer = item.organizer.email_address if item.organizer else 'Unknown'
                     
                     m_attendees = []
@@ -4867,6 +5285,13 @@ class UniversalEmailCleanerApp:
                     if item.optional_attendees:
                         m_attendees.extend([a.mailbox.email_address for a in item.optional_attendees if a.mailbox])
                     m_attendees_str = "; ".join(m_attendees)
+
+                    if criteria_goid and criteria_goid not in str(m_goid or '').lower():
+                        continue
+                    if criteria_clean_goid and criteria_clean_goid not in str(m_clean_goid or '').lower():
+                        continue
+                    if criteria_attendee and not any(criteria_attendee in str(addr).lower() for addr in m_attendees):
+                        continue
                     
                     m_start = getattr(item, 'start', '')
                     m_end = getattr(item, 'end', '')
@@ -5237,7 +5662,7 @@ class UniversalEmailCleanerApp:
             EwsTraceAdapter.logger = None
             EwsTraceAdapter.response_log_path = None
 
-def _show_activation_dialog(parent, on_success=None, allow_exit=True):
+def _show_activation_dialog(parent, on_success=None, allow_exit=True, initial_error=None):
     """显示许可证激活对话框。返回 True 表示激活成功。"""
     if not _HAS_LICENSE:
         return True
@@ -5246,7 +5671,7 @@ def _show_activation_dialog(parent, on_success=None, allow_exit=True):
 
     dlg = tk.Toplevel(parent)
     dlg.title("许可证激活 (License Activation)")
-    dlg.geometry("580x340")
+    dlg.geometry("640x430")
     dlg.resizable(False, False)
     dlg.transient(parent)
     dlg.grab_set()
@@ -5271,6 +5696,22 @@ def _show_activation_dialog(parent, on_success=None, allow_exit=True):
         text="请输入您的许可证密钥以激活应用程序。",
     ).pack(pady=(0, 15))
 
+    machine_code = get_machine_code()
+
+    ttk.Label(frame, text="机器码 (Machine Code):").pack(anchor="w")
+    machine_row = ttk.Frame(frame)
+    machine_row.pack(fill="x", pady=(5, 12))
+    machine_var = tk.StringVar(value=machine_code)
+    machine_entry = ttk.Entry(machine_row, textvariable=machine_var, font=("Consolas", 11), state="readonly")
+    machine_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    def do_copy_machine():
+        dlg.clipboard_clear()
+        dlg.clipboard_append(machine_code)
+        status_var.set("✅ 机器码已复制，请发送给管理员生成专属注册码。")
+
+    ttk.Button(machine_row, text="复制机器码", command=do_copy_machine).pack(side="left")
+
     ttk.Label(frame, text="许可证密钥 (License Key):").pack(anchor="w")
 
     key_var = tk.StringVar()
@@ -5282,13 +5723,16 @@ def _show_activation_dialog(parent, on_success=None, allow_exit=True):
     status_lbl = ttk.Label(frame, textvariable=status_var, wraplength=530)
     status_lbl.pack(anchor="w", pady=(0, 15))
 
+    if initial_error:
+        status_var.set(f"⚠️ {initial_error}")
+
     def do_activate():
         key = key_var.get().strip()
         if not key:
             status_var.set("⚠️ 请输入许可证密钥。")
             return
 
-        res = activate_license(key)
+        res = activate_license(key, machine_code=machine_code)
         if res['success']:
             info = res['info']
             expires_str = info['expires'].strftime('%Y-%m-%d') if info['expires'] else '永久'
@@ -5338,7 +5782,7 @@ if __name__ == "__main__":
         if not license_status['licensed']:
             # 隐藏主窗口，先显示激活对话框
             root.withdraw()
-            activated = _show_activation_dialog(root, allow_exit=True)
+            activated = _show_activation_dialog(root, allow_exit=True, initial_error=license_status.get('error'))
             if not activated:
                 root.destroy()
                 sys.exit(0)
